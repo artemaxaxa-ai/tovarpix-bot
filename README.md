@@ -1,1 +1,0 @@
-# tovarpix-bot
