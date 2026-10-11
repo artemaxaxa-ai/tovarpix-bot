@@ -18,7 +18,7 @@ app = Flask(__name__)
 def start(message):
     bot.send_message(
         message.chat.id,
-        "Привет! 👋 Я TovarPix AI!\n\n"
+        "Привет! 👋 Я Генератор Изображений AI!\n\n"
         "Я помогу подготовить фотографии товаров "
         "для Wildberries и Ozon.\n\n"
         "📸 Отправь фотографию товара, чтобы начать!"
