@@ -1,6 +1,6 @@
 import os
 import logging
-import telebot
+import requests
 from flask import Flask, request, jsonify
 
 logging.basicConfig(
@@ -16,41 +16,82 @@ PORT = int(os.environ.get("PORT", "10000"))
 if not TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN")
 
-bot = telebot.TeleBot(TOKEN)
+API_URL = f"https://api.telegram.org/bot{TOKEN}"
 app = Flask(__name__)
 
 
-@bot.message_handler(commands=["start"])
-def start(message):
-    logger.info("СРАБОТАЛ ОБРАБОТЧИК START: chat_id=%s", message.chat.id)
-    bot.send_message(
-        message.chat.id,
-        "Привет! 👋 Я Генератор Изображений AI!\n\n"
-        "Я помогу подготовить фотографии товаров "
-        "для Wildberries и Ozon.\n\n"
-        "📸 Отправь фотографию товара, чтобы начать!"
+def telegram_api(method, data=None):
+    response = requests.post(
+        f"{API_URL}/{method}",
+        json=data or {},
+        timeout=20
     )
+    response.raise_for_status()
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(result.get("description", "Ошибка Telegram API"))
+
+    return result.get("result")
 
 
-@bot.message_handler(content_types=["photo"])
-def receive_photo(message):
-    logger.info("СРАБОТАЛ ОБРАБОТЧИК ФОТО: chat_id=%s", message.chat.id)
-    bot.send_message(
-        message.chat.id,
-        "Фото получил! 📸\n\n"
-        "Пока генерация изображений ещё не подключена."
-    )
+def send_message(chat_id, text):
+    try:
+        telegram_api("sendMessage", {
+            "chat_id": chat_id,
+            "text": text
+        })
+        logger.info("Ответ отправлен в чат %s", chat_id)
+    except Exception:
+        logger.exception("Не удалось отправить сообщение в чат %s", chat_id)
 
 
-@bot.message_handler(func=lambda message: True)
-def other_messages(message):
+def handle_update(update):
+    message = update.get("message")
+
+    if not message:
+        logger.info(
+            "Пропущено обновление без обычного сообщения: update_id=%s",
+            update.get("update_id")
+        )
+        return
+
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+
+    if not chat_id:
+        logger.warning("У сообщения отсутствует chat_id")
+        return
+
+    text = message.get("text", "")
+
     logger.info(
-        "СРАБОТАЛ ОБРАБОТЧИК ТЕКСТА: text=%r chat_id=%s",
-        message.text,
-        message.chat.id
+        "Получено сообщение: update_id=%s, chat_id=%s, type=%s",
+        update.get("update_id"),
+        chat_id,
+        "photo" if message.get("photo") else "text" if text else "other"
     )
-    bot.send_message(
-        message.chat.id,
+
+    if text.split("@")[0].strip() == "/start":
+        send_message(
+            chat_id,
+            "Привет! 👋 Я Генератор Изображений AI!\n\n"
+            "Я помогу подготовить фотографии товаров "
+            "для Wildberries и Ozon.\n\n"
+            "📸 Отправь фотографию товара, чтобы начать!"
+        )
+        return
+
+    if message.get("photo"):
+        send_message(
+            chat_id,
+            "Фото получил! 📸\n\n"
+            "Пока генерация изображений ещё не подключена."
+        )
+        return
+
+    send_message(
+        chat_id,
         "Сообщение получил! ✅\n\n"
         "Отправь /start или фотографию товара 📸"
     )
@@ -64,11 +105,11 @@ def home():
 @app.route("/bot_info", methods=["GET"])
 def bot_info():
     try:
-        me = bot.get_me()
+        me = telegram_api("getMe")
         return jsonify({
-            "username": me.username,
-            "first_name": me.first_name,
-            "id": me.id
+            "username": me.get("username"),
+            "first_name": me.get("first_name"),
+            "id": me.get("id")
         }), 200
     except Exception:
         logger.exception("Ошибка получения информации о боте")
@@ -77,35 +118,15 @@ def bot_info():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    if not request.is_json:
+        return "Expected JSON", 415
+
     try:
-        raw_data = request.get_data(as_text=True)
-        logger.info("WEBHOOK ПОЛУЧЕН. JSON: %s", raw_data[:2000])
-
-        if not request.is_json:
-            logger.warning("Webhook получил запрос не в JSON")
-            return "Expected JSON", 415
-
-        update = telebot.types.Update.de_json(raw_data)
-
-        if update.message:
-            logger.info(
-                "В ОБНОВЛЕНИИ ЕСТЬ MESSAGE: text=%r, chat_id=%s",
-                update.message.text,
-                update.message.chat.id
-            )
-        elif update.edited_message:
-            logger.info("В ОБНОВЛЕНИИ ЕСТЬ EDITED_MESSAGE")
-        elif update.callback_query:
-            logger.info("В ОБНОВЛЕНИИ ЕСТЬ CALLBACK_QUERY")
-        else:
-            logger.info("ДРУГОЙ ТИП ОБНОВЛЕНИЯ: update_id=%s", update.update_id)
-
-        bot.process_new_updates([update])
-        logger.info("ОБНОВЛЕНИЕ ПЕРЕДАНО ОБРАБОТЧИКАМ")
+        update = request.get_json()
+        handle_update(update)
         return "OK", 200
-
     except Exception:
-        logger.exception("ОШИБКА ОБРАБОТКИ WEBHOOK")
+        logger.exception("Ошибка обработки обновления")
         return "Internal Server Error", 500
 
 
@@ -115,11 +136,11 @@ def set_webhook():
         return "Render URL is not configured", 500
 
     try:
-        success = bot.set_webhook(url=f"{RENDER_URL}/webhook")
-        if success:
-            logger.info("Webhook установлен")
-            return "Webhook configured", 200
-        return "Webhook setup failed", 500
+        result = telegram_api("setWebhook", {
+            "url": f"{RENDER_URL}/webhook"
+        })
+        logger.info("Webhook установлен: %s", result)
+        return "Webhook configured", 200
     except Exception:
         logger.exception("Ошибка установки webhook")
         return "Webhook setup error", 500
@@ -128,13 +149,13 @@ def set_webhook():
 @app.route("/webhook_status", methods=["GET"])
 def webhook_status():
     try:
-        info = bot.get_webhook_info()
+        info = telegram_api("getWebhookInfo")
         return jsonify({
-            "url_configured": bool(info.url),
-            "url_matches_render": info.url == f"{RENDER_URL}/webhook",
-            "pending_update_count": info.pending_update_count,
-            "last_error_date": info.last_error_date,
-            "last_error_message": info.last_error_message
+            "url_configured": bool(info.get("url")),
+            "url_matches_render": info.get("url") == f"{RENDER_URL}/webhook",
+            "pending_update_count": info.get("pending_update_count"),
+            "last_error_date": info.get("last_error_date"),
+            "last_error_message": info.get("last_error_message")
         }), 200
     except Exception:
         logger.exception("Ошибка проверки webhook")
