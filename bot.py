@@ -1,15 +1,17 @@
+
 import os
 import logging
 import telebot
+from flask import Flask, request
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("BOT_TOKEN")
-
+TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN")
 
 bot = telebot.TeleBot(TOKEN)
+app = Flask(__name__)
 
 
 @bot.message_handler(commands=["start"])
@@ -28,9 +30,8 @@ def receive_photo(message):
     bot.send_message(
         message.chat.id,
         "Фото получил! 📸\n\n"
-        "Скоро здесь появится обработка фотографий "
-        "с помощью искусственного интеллекта.\n\n"
-        "Пока я нахожусь в разработке."
+        "Пока обработка фотографий с помощью ИИ "
+        "ещё не подключена."
     )
 
 
@@ -42,6 +43,27 @@ def other_messages(message):
     )
 
 
-if __name__ == "__main__":
-    logging.info("TovarPix AI запущен")
-    bot.infinity_polling(skip_pending=True)
+@app.route("/", methods=["GET"])
+def home():
+    return "TovarPix AI is running!", 200
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    if request.headers.get("content-type", "").startswith("application/json"):
+        update = telebot.types.Update.de_json(
+            request.get_data().decode("utf-8")
+        )
+        bot.process_new_updates([update])
+        return "OK", 200
+    return "Unsupported Media Type", 415
+
+
+@app.route("/set_webhook", methods=["GET"])
+def set_webhook():
+    webhook_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not webhook_url:
+        return "Render URL is not configured", 500
+
+    success = bot.set_webhook(url=f"{webhook_url}/webhook")
+    return ("Webhook configured", 200) if success else ("Webhook setup failed", 500)
