@@ -1,4 +1,3 @@
-
 import os
 import logging
 import telebot
@@ -26,7 +25,7 @@ bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
 
-# Обработка команды /start
+# Команда /start
 @bot.message_handler(commands=["start"])
 def start(message):
     logger.info("Получена команда /start")
@@ -39,7 +38,7 @@ def start(message):
     )
 
 
-# Обработка фотографий
+# Получение фотографий
 @bot.message_handler(content_types=["photo"])
 def receive_photo(message):
     logger.info("Получена фотография")
@@ -60,13 +59,30 @@ def other_messages(message):
     )
 
 
+# Проверка имени бота
+@app.route("/bot_info", methods=["GET"])
+def bot_info():
+    try:
+        me = bot.get_me()
+        return jsonify({
+            "username": me.username,
+            "first_name": me.first_name,
+            "id": me.id
+        }), 200
+    except Exception:
+        logger.exception("Ошибка получения информации о боте")
+        return jsonify({
+            "error": "Не удалось получить информацию о боте"
+        }), 500
+
+
 # Проверка сервиса
 @app.route("/", methods=["GET"])
 def home():
     return "TovarPix AI is running!", 200
 
 
-# Telegram присылает сюда обновления
+# Получение обновлений Telegram
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if not request.is_json:
@@ -86,14 +102,17 @@ def webhook():
         return "Internal Server Error", 500
 
 
-# Первичная установка webhook
+# Установка webhook
 @app.route("/set_webhook", methods=["GET"])
 def set_webhook():
     if not RENDER_URL:
         return "Render URL is not configured", 500
 
     try:
-        success = bot.set_webhook(url=f"{RENDER_URL}/webhook")
+        success = bot.set_webhook(
+            url=f"{RENDER_URL}/webhook"
+        )
+
         if success:
             logger.info("Webhook установлен")
             return "Webhook configured", 200
@@ -115,12 +134,14 @@ def webhook_status():
             "url_matches_render": info.url == f"{RENDER_URL}/webhook",
             "pending_update_count": info.pending_update_count,
             "last_error_date": info.last_error_date,
-            "last_error_message": info.last_error_message,
+            "last_error_message": info.last_error_message
         }), 200
 
     except Exception:
         logger.exception("Ошибка проверки webhook")
-        return jsonify({"error": "Не удалось проверить webhook"}), 500
+        return jsonify({
+            "error": "Не удалось проверить webhook"
+        }), 500
 
 
 if __name__ == "__main__":
