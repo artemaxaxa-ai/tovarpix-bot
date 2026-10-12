@@ -1,4 +1,3 @@
-
 import os
 import io
 import uuid
@@ -7,27 +6,43 @@ import base64
 import logging
 import threading
 import tempfile
+import time
 from pathlib import Path
+from datetime import datetime, timezone
+from collections import defaultdict, deque
 
 import requests
 import psycopg
 from flask import Flask, request, jsonify
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from magic_hour import Client
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-logger = logging.getLogger(__name__)
 
-TOKEN = os.environ.get("BOT_TOKEN")
-MAGIC_HOUR_API_KEY = os.environ.get("MAGIC_HOUR_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+# ============================================================
+# TOVARPIX — AI-редактор фотографий товаров
+# ============================================================
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s"
+)
+logger = logging.getLogger("tovarpix")
+
+TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+MAGIC_HOUR_API_KEY = os.environ.get("MAGIC_HOUR_API_KEY", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
+WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
+
+MAX_IMAGE_BYTES = int(os.environ.get(
+    "MAX_IMAGE_BYTES", str(20 * 1024 * 1024)
+))
+MAX_IMAGE_SIDE = int(os.environ.get("MAX_IMAGE_SIDE", "8000"))
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "30"))
+RATE_LIMIT_MESSAGES = int(os.environ.get("RATE_LIMIT_MESSAGES", "12"))
 
 ADMIN_IDS = {
     value.strip()
@@ -37,6 +52,8 @@ ADMIN_IDS = {
 
 PACKAGE_IMAGES = 5
 PACKAGE_STARS = 5
+MAX_PROMPT_LENGTH = 1500
+APP_STARTED_AT = time.time()
 
 if not TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN")
@@ -49,16 +66,102 @@ API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 app = Flask(__name__)
 http = requests.Session()
+http.headers.update({"User-Agent": "TovarPix/2.0"})
 magic_client = Client(token=MAGIC_HOUR_API_KEY)
 
 pending_photos = {}
 busy_chats = set()
-state_lock = threading.Lock()
+
+state_lock = threading.RLock()
+rate_lock = threading.Lock()
+message_times = defaultdict(deque)
+
+runtime_stats = {
+    "updates": 0,
+    "images_started": 0,
+    "images_succeeded": 0,
+    "images_failed": 0,
+    "cards_rendered": 0,
+    "last_error": None,
+    "last_success_at": None,
+}
 
 
-# =========================
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def is_admin(chat_id):
+    return str(chat_id) in ADMIN_IDS
+
+
+def clean_user_text(value, limit=MAX_PROMPT_LENGTH):
+    value = str(value or "").replace("\x00", " ").strip()
+    value = " ".join(value.split())
+    return value[:limit]
+
+
+def note_runtime_error(error):
+    with state_lock:
+        runtime_stats["last_error"] = {
+            "at": utc_now_iso(),
+            "type": type(error).__name__,
+            "message": str(error)[:300],
+        }
+
+
+def allow_message_rate(chat_id):
+    now = time.monotonic()
+
+    with rate_lock:
+        bucket = message_times[chat_id]
+
+        while bucket and now - bucket[0] > RATE_LIMIT_WINDOW:
+            bucket.popleft()
+
+        if len(bucket) >= RATE_LIMIT_MESSAGES:
+            return False
+
+        bucket.append(now)
+        return True
+
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    if minutes:
+        return f"{minutes} мин {secs} сек"
+
+    return f"{secs} сек"
+
+
+def user_balance_text(balance):
+    if balance.get("admin"):
+        return "👑 У тебя безлимит."
+
+    free_text = (
+        "доступна"
+        if not balance["free_used"]
+        else "уже использована"
+    )
+
+    return (
+        f"🎁 Бесплатная обработка: {free_text}.\n"
+        f"⭐ Купленных обработок: {balance['credits']}."
+    )
+
+
+# ============================================================
 # DATABASE
-# =========================
+# ============================================================
 
 def db_connect():
     return psycopg.connect(DATABASE_URL, connect_timeout=15)
@@ -74,6 +177,7 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS payments (
                 charge_id TEXT PRIMARY KEY,
@@ -83,14 +187,47 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS processing_events (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL,
+                event_type TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_processing_events_created
+            ON processing_events(created_at)
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_processing_events_user
+            ON processing_events(telegram_id, created_at)
+        """)
+
     logger.info("PostgreSQL database is ready")
 
 
-init_db()
-
-
-def is_admin(chat_id):
-    return str(chat_id) in ADMIN_IDS
+def record_event(chat_id, event_type, detail=""):
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO processing_events
+                    (telegram_id, event_type, detail)
+                VALUES (%s, %s, %s)
+                """,
+                (
+                    int(chat_id),
+                    str(event_type)[:40],
+                    str(detail)[:300]
+                )
+            )
+    except Exception:
+        logger.exception("Could not record processing event")
 
 
 def ensure_user(chat_id):
@@ -191,6 +328,7 @@ def refund_credit(chat_id, credit_type):
                 """,
                 (chat_id,)
             )
+
         elif credit_type == "paid":
             conn.execute(
                 """
@@ -202,18 +340,57 @@ def refund_credit(chat_id, credit_type):
             )
 
 
-# =========================
-# TELEGRAM API
-# =========================
+def get_admin_stats():
+    with db_connect() as conn:
+        users = conn.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(credits), 0)
+            FROM users
+            """
+        ).fetchone()
 
-def telegram_api(method, data=None):
+        payments = conn.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(stars), 0),
+                   COALESCE(SUM(credits), 0)
+            FROM payments
+            """
+        ).fetchone()
+
+        events = conn.execute(
+            """
+            SELECT event_type, COUNT(*)
+            FROM processing_events
+            WHERE created_at > NOW() - INTERVAL '7 days'
+            GROUP BY event_type
+            """
+        ).fetchall()
+
+    return {
+        "users": users[0],
+        "credits_remaining": users[1],
+        "payment_count": payments[0],
+        "stars_total": payments[1],
+        "credits_sold": payments[2],
+        "events_7d": dict(events),
+    }
+
+
+init_db()
+
+
+# ============================================================
+# TELEGRAM API
+# ============================================================
+
+def telegram_api(method, data=None, timeout=35):
     response = http.post(
         f"{API_URL}/{method}",
         json=data or {},
-        timeout=35
+        timeout=timeout
     )
-    response.raise_for_status()
 
+    response.raise_for_status()
     result = response.json()
 
     if not result.get("ok"):
@@ -224,14 +401,17 @@ def telegram_api(method, data=None):
     return result.get("result")
 
 
-def send_message(chat_id, text, reply_markup=None):
+def send_message(chat_id, text, reply_markup=None, parse_mode=None):
     data = {
         "chat_id": chat_id,
-        "text": text
+        "text": str(text)[:4096]
     }
 
     if reply_markup:
         data["reply_markup"] = reply_markup
+
+    if parse_mode:
+        data["parse_mode"] = parse_mode
 
     try:
         telegram_api("sendMessage", data)
@@ -247,9 +427,14 @@ def main_keyboard():
                 {"text": "💡 Пример промпта"},
                 {"text": "💰 Баланс"}
             ],
+            [
+                {"text": "❓ Помощь"},
+                {"text": "📋 Возможности"}
+            ],
             [{"text": "❌ Отмена"}]
         ],
-        "resize_keyboard": True
+        "resize_keyboard": True,
+        "is_persistent": True
     }
 
 
@@ -264,9 +449,9 @@ def reset_keyboard(chat_id):
     )
 
 
-# =========================
+# ============================================================
 # TELEGRAM STARS PAYMENTS
-# =========================
+# ============================================================
 
 def send_invoice(chat_id):
     payload = f"tovarpix_pack5_{chat_id}_{uuid.uuid4().hex}"
@@ -310,7 +495,8 @@ def handle_pre_checkout(query):
         answer_pre_checkout(
             query["id"],
             valid,
-            None if valid else "Не удалось проверить заказ. Попробуй снова."
+            None if valid else
+            "Не удалось проверить заказ. Попробуй снова."
         )
 
     except Exception:
@@ -339,8 +525,10 @@ def handle_successful_payment(message):
         if chat_id:
             send_message(
                 chat_id,
-                "Не удалось автоматически проверить платёж. Обратись в поддержку."
+                "Не удалось автоматически проверить платёж. "
+                "Обратись в поддержку."
             )
+
         return
 
     try:
@@ -369,6 +557,12 @@ def handle_successful_payment(message):
                 )
 
         if inserted:
+            record_event(
+                chat_id,
+                "payment",
+                f"{amount} Stars; {PACKAGE_IMAGES} credits"
+            )
+
             send_message(
                 chat_id,
                 "✅ Оплата получена!\n\n"
@@ -388,9 +582,9 @@ def handle_successful_payment(message):
         )
 
 
-# =========================
-# IMAGE DOWNLOAD
-# =========================
+# ============================================================
+# IMAGE DOWNLOAD AND VALIDATION
+# ============================================================
 
 def download_telegram_photo(file_id):
     info = telegram_api("getFile", {"file_id": file_id})
@@ -404,12 +598,74 @@ def download_telegram_photo(file_id):
         timeout=45
     )
     response.raise_for_status()
+
+    if len(response.content) > MAX_IMAGE_BYTES:
+        raise RuntimeError("Фото больше допустимого размера")
+
     return response.content
 
 
-# =========================
+def normalize_image_bytes(
+    image_bytes,
+    max_side=MAX_IMAGE_SIDE,
+    quality=94
+):
+    """Apply EXIF rotation and normalize image to a compatible JPEG."""
+    with Image.open(io.BytesIO(image_bytes)) as original:
+        image = ImageOps.exif_transpose(original)
+
+        if image.width > max_side or image.height > max_side:
+            image.thumbnail(
+                (max_side, max_side),
+                Image.Resampling.LANCZOS
+            )
+
+        if image.mode in ("RGBA", "LA"):
+            background = Image.new("RGBA", image.size, "white")
+            background.alpha_composite(image.convert("RGBA"))
+            image = background.convert("RGB")
+        else:
+            image = image.convert("RGB")
+
+        output = io.BytesIO()
+        image.save(
+            output,
+            format="JPEG",
+            quality=quality,
+            optimize=True
+        )
+
+        return output.getvalue()
+
+
+def inspect_image(image_bytes):
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            width, height = image.size
+            image_format = image.format or "unknown"
+
+            if width < 64 or height < 64:
+                raise RuntimeError("Изображение слишком маленькое")
+
+            if width > 30000 or height > 30000:
+                raise RuntimeError("Размеры изображения слишком большие")
+
+            return {
+                "width": width,
+                "height": height,
+                "format": image_format,
+                "pixels": width * height,
+            }
+
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("Не удалось прочитать изображение") from exc
+
+
+# ============================================================
 # QWEN IMAGE EDITOR
-# =========================
+# ============================================================
 
 BASE_PROMPT = """
 You are a professional commercial product photographer and retoucher.
@@ -424,7 +680,8 @@ Keep the original product recognizable and faithful to the input.
 Preserve its exact shape, proportions, color, materials, buttons,
 camera layout, ports, labels, branding, logos and small physical details.
 Do not redesign, replace, duplicate or invent any product parts.
-Do not change any text printed on the product.
+Do not change any text printed on the product. Preserve the exact number
+and position of cameras, buttons, stickers, holes, lenses and accessories.
 
 BACKGROUND AND LIGHTING:
 Make the requested environment look like a real professional photo shoot.
@@ -457,15 +714,14 @@ def generate_product_image(image_bytes, user_prompt):
     prompt = (
         BASE_PROMPT
         + "\nUSER REQUEST:\n"
-        + user_prompt[:1500]
+        + clean_user_text(user_prompt)
     )
+
+    normalized = normalize_image_bytes(image_bytes)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         input_path = Path(temp_dir) / "input.jpg"
-
-        with Image.open(io.BytesIO(image_bytes)) as image:
-            image = image.convert("RGB")
-            image.save(input_path, format="JPEG", quality=95)
+        input_path.write_bytes(normalized)
 
         result = magic_client.v1.ai_image_editor.generate(
             name="TovarPix product photo",
@@ -488,34 +744,43 @@ def generate_product_image(image_bytes, user_prompt):
                     f"Magic Hour: {error.code}: {error.message}"
                 )
 
-            raise RuntimeError(f"Generation status: {result.status}")
+            raise RuntimeError(
+                f"Generation status: {result.status}"
+            )
 
         paths = result.downloaded_paths
 
         if not paths or not Path(str(paths[0])).is_file():
             raise RuntimeError("Generated image file not found")
 
-        output = io.BytesIO(Path(str(paths[0])).read_bytes())
-        output.seek(0)
-        return output
+        output_bytes = Path(str(paths[0])).read_bytes()
+
+        normalized_output = normalize_image_bytes(
+            output_bytes,
+            max_side=3000,
+            quality=94
+        )
+
+        return io.BytesIO(normalized_output)
 
 
-# =========================
-# GEMINI: AD TEXT GENERATION
-# =========================
+# ============================================================
+# GEMINI — AD TEXT GENERATION
+# ============================================================
 
 def get_ad_copy(image_bytes, user_prompt):
-    """
-    Gemini decides whether the user explicitly requested an ad card.
-    Returns validated text fields, or None if no card is needed.
-    """
-
+    """Generate validated advertising copy only when requested."""
     if not GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY is not configured")
         return None
 
-    with Image.open(io.BytesIO(image_bytes)) as image:
-        image = image.convert("RGB")
+    normalized = normalize_image_bytes(
+        image_bytes,
+        max_side=1000,
+        quality=80
+    )
+
+    with Image.open(io.BytesIO(normalized)) as image:
         image.thumbnail((512, 512))
         image_buffer = io.BytesIO()
         image.save(image_buffer, format="JPEG", quality=78)
@@ -524,9 +789,9 @@ def get_ad_copy(image_bytes, user_prompt):
 Ты — арт-директор интернет-магазина и копирайтер рекламных карточек.
 
 Запрос пользователя:
-{user_prompt[:1500]}
+{clean_user_text(user_prompt)}
 
-Верни только JSON такого вида:
+Верни только JSON:
 {{
   "make_ad_card": true,
   "title": "Короткий заголовок",
@@ -540,23 +805,17 @@ def get_ad_copy(image_bytes, user_prompt):
 1. make_ad_card=true только если пользователь просит рекламу,
    рекламную карточку, баннер, продающий дизайн, текст на фото,
    плашки или характеристики товара.
-2. Если пользователь просит только заменить фон, улучшить свет,
-   повернуть предмет или ретушировать фото — make_ad_card=false.
+2. Если запрос только про фон, свет, поворот или ретушь — false.
 3. Не придумывай цену, скидку, гарантию, технические параметры,
    комплект поставки или другие факты.
 4. В features используй только характеристики, явно указанные
    пользователем. Если их нет, верни пустой список.
-5. Если пользователь просит рекламу, но данных мало, можно сделать
-   нейтральный заголовок без выдуманных характеристик.
-6. title — не более 34 символов.
-7. subtitle — не более 55 символов.
-8. badge — не более 18 символов.
-9. features — максимум 3 пункта, каждый до 32 символов.
-10. Пиши на русском языке.
-11. Не утверждай, что видимые детали или характеристики подтверждены,
-    если их нельзя достоверно определить по фото.
-12. accent — только один из цветов #D9FF43, #FFFFFF, #65D6FF,
-    #FFB86B или #FF7A90.
+5. Если данных мало, используй нейтральный заголовок.
+6. title до 34 символов; subtitle до 55; badge до 18.
+7. features — максимум 3 пункта, каждый до 32 символов.
+8. Пиши по-русски, без эмодзи в заголовке.
+9. Не выдавай догадки о товаре за факты.
+10. accent — только #D9FF43, #FFFFFF, #65D6FF, #FFB86B или #FF7A90.
 """
 
     response = requests.post(
@@ -579,7 +838,7 @@ def get_ad_copy(image_bytes, user_prompt):
             }],
             "generationConfig": {
                 "responseMimeType": "application/json",
-                "temperature": 0.3,
+                "temperature": 0.25,
                 "maxOutputTokens": 400
             }
         },
@@ -588,14 +847,18 @@ def get_ad_copy(image_bytes, user_prompt):
 
     response.raise_for_status()
     body = response.json()
-
     candidates = body.get("candidates", [])
+
     if not candidates:
         raise RuntimeError("Gemini returned no candidates")
 
     parts = candidates[0].get("content", {}).get("parts", [])
     answer = next(
-        (part.get("text", "") for part in parts if part.get("text")),
+        (
+            part.get("text", "")
+            for part in parts
+            if part.get("text")
+        ),
         ""
     )
 
@@ -615,41 +878,53 @@ def get_ad_copy(image_bytes, user_prompt):
         return None
 
     allowed_accents = {
-        "#D9FF43", "#FFFFFF", "#65D6FF", "#FFB86B", "#FF7A90"
+        "#D9FF43",
+        "#FFFFFF",
+        "#65D6FF",
+        "#FFB86B",
+        "#FF7A90"
     }
+
     accent = str(data.get("accent", "#D9FF43")).upper()
+
     if accent not in allowed_accents:
         accent = "#D9FF43"
 
+    raw_features = data.get("features", [])
+
+    if not isinstance(raw_features, list):
+        raw_features = []
+
     return {
-        "title": str(data.get("title", ""))[:34],
-        "subtitle": str(data.get("subtitle", ""))[:55],
-        "badge": str(data.get("badge", ""))[:18],
+        "title": clean_user_text(data.get("title", ""), 34),
+        "subtitle": clean_user_text(data.get("subtitle", ""), 55),
+        "badge": clean_user_text(data.get("badge", ""), 18),
         "features": [
-            str(item)[:32]
-            for item in data.get("features", [])
+            clean_user_text(item, 32)
+            for item in raw_features
             if isinstance(item, str)
+            and clean_user_text(item, 32)
         ][:3],
-        "accent": accent
+        "accent": accent,
     }
 
 
-# =========================
-# PILLOW: DRAW REAL TEXT
-# =========================
+# ============================================================
+# PILLOW — DESIGN AND TYPOGRAPHY
+# ============================================================
 
 def load_font(size, bold=False):
     if bold:
         paths = [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
         ]
     else:
         paths = [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeSans.ttf"
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
         ]
 
     for path in paths:
@@ -661,119 +936,359 @@ def load_font(size, bold=False):
     return ImageFont.load_default()
 
 
+def text_width(draw, text, font):
+    box = draw.textbbox((0, 0), str(text), font=font)
+    return box[2] - box[0]
+
+
 def fit_text(draw, text, font, max_width):
-    """
-    Shorten a line only if it exceeds the available width.
-    """
-    text = str(text)
-    if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+    text = str(text or "").strip()
+
+    if text_width(draw, text, font) <= max_width:
         return text
 
     while text:
         candidate = text.rstrip() + "…"
-        if draw.textbbox((0, 0), candidate, font=font)[2] <= max_width:
+
+        if text_width(draw, candidate, font) <= max_width:
             return candidate
+
         text = text[:-1]
 
     return ""
 
 
-def render_ad_card(image_bytes, ad):
-    with Image.open(io.BytesIO(image_bytes)) as source:
-        product_image = source.convert("RGB")
-        product_image.thumbnail((640, 640))
+def wrap_text(draw, text, font, max_width, max_lines=2):
+    words = str(text or "").split()
+    lines = []
+    current = ""
 
-    width, image_height = product_image.size
-    footer_height = 210
-    accent = ad.get("accent", "#D9FF43")
+    for word in words:
+        candidate = word if not current else current + " " + word
 
-    canvas = Image.new(
-        "RGB",
-        (width, image_height + footer_height),
-        "#17191F"
-    )
-    canvas.paste(product_image, (0, 0))
+        if text_width(draw, candidate, font) <= max_width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+
+        if len(lines) >= max_lines:
+            break
+
+    if current and len(lines) < max_lines:
+        lines.append(current)
+
+    if len(lines) == max_lines and words:
+        joined = " ".join(lines)
+
+        if len(joined) < len(str(text).strip()):
+            lines[-1] = fit_text(
+                draw,
+                lines[-1],
+                font,
+                max_width
+            )
+
+    return lines
+
+
+def hex_to_rgb(value, fallback=(217, 255, 67)):
+    try:
+        value = str(value).lstrip("#")
+
+        if len(value) != 6:
+            return fallback
+
+        return tuple(
+            int(value[index:index + 2], 16)
+            for index in (0, 2, 4)
+        )
+
+    except Exception:
+        return fallback
+
+
+def draw_gradient(canvas, box, top_color, bottom_color):
+    x0, y0, x1, y1 = box
+    height = max(1, y1 - y0)
+
+    top = hex_to_rgb(top_color, (24, 26, 32))
+    bottom = hex_to_rgb(bottom_color, (13, 15, 20))
 
     draw = ImageDraw.Draw(canvas)
 
-    title_font = load_font(25, bold=True)
-    subtitle_font = load_font(15)
-    badge_font = load_font(13, bold=True)
-    feature_font = load_font(13)
+    for offset in range(height):
+        ratio = offset / max(1, height - 1)
 
-    x = 18
-    y = image_height + 12
-    max_width = width - 36
+        color = tuple(
+            int(
+                top[channel] * (1 - ratio)
+                + bottom[channel] * ratio
+            )
+            for channel in range(3)
+        )
 
-    badge = ad.get("badge", "").strip()
+        draw.line(
+            (x0, y0 + offset, x1, y0 + offset),
+            fill=color
+        )
+
+
+def render_ad_card(image_bytes, ad):
+    """
+    Create a premium dark product card.
+    The original product image is not cropped to fill the frame.
+    Advertising text is rendered locally using Pillow.
+    """
+    normalized = normalize_image_bytes(
+        image_bytes,
+        max_side=1200,
+        quality=93
+    )
+
+    with Image.open(io.BytesIO(normalized)) as source:
+        product_image = source.convert("RGB")
+
+    width = 1080
+    margin = 58
+    image_area_height = 880
+    footer_height = 430
+    total_height = image_area_height + footer_height
+
+    product_image.thumbnail(
+        (
+            width - 2 * margin,
+            image_area_height - 2 * margin
+        ),
+        Image.Resampling.LANCZOS
+    )
+
+    canvas = Image.new(
+        "RGB",
+        (width, total_height),
+        "#101218"
+    )
+
+    draw_gradient(
+        canvas,
+        (0, 0, width, image_area_height),
+        "#292D36",
+        "#161920"
+    )
+
+    px = (width - product_image.width) // 2
+    py = (image_area_height - product_image.height) // 2
+
+    canvas.paste(product_image, (px, py))
+
+    draw = ImageDraw.Draw(canvas)
+
+    draw.line(
+        (
+            margin,
+            image_area_height,
+            width - margin,
+            image_area_height
+        ),
+        fill="#383D47",
+        width=2
+    )
+
+    footer_top = image_area_height
+
+    draw_gradient(
+        canvas,
+        (0, footer_top, width, total_height),
+        "#171A21",
+        "#0E1015"
+    )
+
+    draw = ImageDraw.Draw(canvas)
+
+    accent = ad.get("accent", "#D9FF43")
+    accent_rgb = hex_to_rgb(accent)
+
+    x = margin
+    y = footer_top + 38
+    content_width = width - margin * 2
+
+    overline_font = load_font(19, bold=True)
+
+    draw.text(
+        (x, y),
+        "TOVARPIX  /  PRODUCT EDITION",
+        font=overline_font,
+        fill=accent_rgb
+    )
+
+    y += 42
+
+    badge = clean_user_text(ad.get("badge", ""), 18)
+
     if badge:
-        badge_font_height = 25
-        badge_text = fit_text(draw, badge, badge_font, max_width - 22)
-        text_width = draw.textbbox((0, 0), badge_text, font=badge_font)[2]
-        pill_width = min(width - 36, text_width + 22)
+        badge_font = load_font(22, bold=True)
+
+        badge_text = fit_text(
+            draw,
+            badge,
+            badge_font,
+            content_width - 42
+        )
+
+        badge_width = min(
+            content_width,
+            text_width(draw, badge_text, badge_font) + 42
+        )
+
+        badge_height = 48
 
         draw.rounded_rectangle(
-            (x, y, x + pill_width, y + badge_font_height),
-            radius=8,
-            fill=accent
+            (
+                x,
+                y,
+                x + badge_width,
+                y + badge_height
+            ),
+            radius=15,
+            fill=accent_rgb
         )
+
         draw.text(
-            (x + 11, y + 5),
+            (x + 21, y + 9),
             badge_text,
             font=badge_font,
-            fill="#17191F"
+            fill="#111318"
         )
-        y += 32
 
-    title = fit_text(
+        y += badge_height + 20
+
+    title = clean_user_text(ad.get("title", ""), 34)
+    title_font = load_font(47, bold=True)
+
+    title_lines = wrap_text(
         draw,
-        ad.get("title", "").strip(),
+        title,
         title_font,
-        max_width
+        content_width,
+        max_lines=2
     )
-    if title:
-        draw.text((x, y), title, font=title_font, fill="#FFFFFF")
-        y += 34
 
-    subtitle = fit_text(
+    for line in title_lines:
+        draw.text(
+            (x, y),
+            line,
+            font=title_font,
+            fill="#FFFFFF"
+        )
+        y += 58
+
+    if title_lines:
+        y += 2
+
+    subtitle = clean_user_text(ad.get("subtitle", ""), 55)
+    subtitle_font = load_font(25)
+
+    for line in wrap_text(
         draw,
-        ad.get("subtitle", "").strip(),
+        subtitle,
         subtitle_font,
-        max_width
-    )
-    if subtitle:
+        content_width,
+        max_lines=2
+    ):
         draw.text(
             (x, y),
-            subtitle,
+            line,
             font=subtitle_font,
-            fill="#D2D4DA"
+            fill="#BFC4CE"
         )
-        y += 24
+        y += 35
 
-    features = ad.get("features", [])
-    if features and y + 20 <= image_height + footer_height - 8:
-        feature_text = "  •  ".join(features)
-        feature_text = fit_text(
-            draw, feature_text, feature_font, max_width
-        )
-        draw.text(
-            (x, y),
-            feature_text,
-            font=feature_font,
-            fill=accent
-        )
+    features = ad.get("features", [])[:3]
+
+    if features:
+        y += 17
+        feature_font = load_font(22)
+
+        for feature in features:
+            label = clean_user_text(feature, 32)
+
+            label = fit_text(
+                draw,
+                label,
+                feature_font,
+                content_width - 38
+            )
+
+            box_width = min(
+                content_width,
+                text_width(draw, label, feature_font) + 38
+            )
+
+            if y + 38 > total_height - 42:
+                break
+
+            draw.rounded_rectangle(
+                (
+                    x,
+                    y,
+                    x + box_width,
+                    y + 36
+                ),
+                radius=10,
+                outline="#424854",
+                width=2
+            )
+
+            draw.ellipse(
+                (
+                    x + 12,
+                    y + 13,
+                    x + 22,
+                    y + 23
+                ),
+                fill=accent_rgb
+            )
+
+            draw.text(
+                (x + 31, y + 5),
+                label,
+                font=feature_font,
+                fill="#E8EAF0"
+            )
+
+            y += 43
+
+    brand_font = load_font(17, bold=True)
+    brand = "PRODUCT PHOTOGRAPHY • TOVARPIX"
+    brand_width = text_width(draw, brand, brand_font)
+
+    draw.text(
+        (
+            width - margin - brand_width,
+            total_height - 31
+        ),
+        brand,
+        font=brand_font,
+        fill="#777E8A"
+    )
 
     output = io.BytesIO()
-    canvas.save(output, format="JPEG", quality=92, optimize=True)
+
+    canvas.save(
+        output,
+        format="JPEG",
+        quality=93,
+        optimize=True,
+        progressive=True
+    )
+
     output.seek(0)
     return output
 
 
 def add_ad_layout_if_requested(image_bytes, user_prompt):
-    """
-    The Qwen image is always preserved as a fallback.
-    A Gemini failure never fails the image-processing job.
-    """
+    """If ad rendering fails, return the processed Qwen image unchanged."""
     try:
         ad = get_ad_copy(image_bytes, user_prompt)
 
@@ -782,17 +1297,22 @@ def add_ad_layout_if_requested(image_bytes, user_prompt):
             return io.BytesIO(image_bytes)
 
         result = render_ad_card(image_bytes, ad)
+
+        with state_lock:
+            runtime_stats["cards_rendered"] += 1
+
         logger.info("Gemini ad card rendered successfully")
         return result
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Gemini ad layout failed; using Qwen image")
+        note_runtime_error(exc)
         return io.BytesIO(image_bytes)
 
 
-# =========================
-# SEND IMAGE TO TELEGRAM
-# =========================
+# ============================================================
+# SEND PHOTO TO TELEGRAM
+# ============================================================
 
 def send_generated_photo(chat_id, image_buffer):
     image_buffer.seek(0)
@@ -814,17 +1334,24 @@ def send_generated_photo(chat_id, image_buffer):
     )
 
     response.raise_for_status()
+    body = response.json()
 
-    if not response.json().get("ok"):
-        raise RuntimeError("Telegram could not send result")
+    if not body.get("ok"):
+        raise RuntimeError(
+            body.get("description", "Telegram could not send result")
+        )
 
 
-# =========================
-# PROCESS USER PHOTO
-# =========================
+# ============================================================
+# PHOTO PROCESSING
+# ============================================================
 
 def process_photo(chat_id, file_id, prompt):
     credit_type = None
+    started = time.monotonic()
+
+    with state_lock:
+        runtime_stats["images_started"] += 1
 
     try:
         credit_type = reserve_credit(chat_id)
@@ -839,6 +1366,17 @@ def process_photo(chat_id, file_id, prompt):
             )
             return
 
+        prompt = clean_user_text(prompt)
+
+        if not prompt:
+            raise RuntimeError("Пустое описание обработки")
+
+        record_event(
+            chat_id,
+            "processing_started",
+            prompt[:180]
+        )
+
         send_message(
             chat_id,
             "🎨 Принял описание! Обрабатываю фотографию.\n"
@@ -847,24 +1385,39 @@ def process_photo(chat_id, file_id, prompt):
 
         image_bytes = download_telegram_photo(file_id)
 
-        if len(image_bytes) > 20 * 1024 * 1024:
-            raise RuntimeError("Фото больше 20 МБ")
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+            raise RuntimeError("Фото больше допустимого размера")
 
-        with Image.open(io.BytesIO(image_bytes)) as image:
-            image.verify()
+        image_info = inspect_image(image_bytes)
 
-        # 1. Qwen edits the photograph.
+        logger.info(
+            "Image accepted: chat=%s format=%s size=%sx%s bytes=%s",
+            chat_id,
+            image_info["format"],
+            image_info["width"],
+            image_info["height"],
+            len(image_bytes)
+        )
+
         result = generate_product_image(image_bytes, prompt)
         qwen_bytes = result.getvalue()
 
-        # 2. Gemini adds a designed ad footer only when requested.
-        # If Gemini fails, the Qwen image is sent unchanged.
         final_result = add_ad_layout_if_requested(
             qwen_bytes,
             prompt
         )
 
         send_generated_photo(chat_id, final_result)
+
+        with state_lock:
+            runtime_stats["images_succeeded"] += 1
+            runtime_stats["last_success_at"] = utc_now_iso()
+
+        record_event(
+            chat_id,
+            "processing_succeeded",
+            f"duration={int(time.monotonic() - started)}s"
+        )
 
         balance = get_balance(chat_id)
 
@@ -882,8 +1435,18 @@ def process_photo(chat_id, file_id, prompt):
             main_keyboard()
         )
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Image processing failed")
+        note_runtime_error(exc)
+
+        with state_lock:
+            runtime_stats["images_failed"] += 1
+
+        record_event(
+            chat_id,
+            "processing_failed",
+            type(exc).__name__
+        )
 
         if credit_type:
             try:
@@ -891,11 +1454,22 @@ def process_photo(chat_id, file_id, prompt):
             except Exception:
                 logger.exception("Credit refund failed")
 
+        message = (
+            "😕 Не удалось обработать фото. Списание будет возвращено, "
+            "если база данных доступна.\n\n"
+            "Попробуй ещё раз позже. Если ошибка повторяется, "
+            "сообщи администратору."
+        )
+
+        if (
+            "больше" in str(exc).lower()
+            or "маленькое" in str(exc).lower()
+        ):
+            message = f"⚠️ {str(exc)}"
+
         send_message(
             chat_id,
-            "😕 Не удалось обработать фото. Если обработка "
-            "не завершилась, лимит будет восстановлен, "
-            "если база данных доступна.\n\nПопробуй позже.",
+            message,
             main_keyboard()
         )
 
@@ -905,6 +1479,16 @@ def process_photo(chat_id, file_id, prompt):
 
 
 def start_processing(chat_id, file_id, prompt):
+    prompt = clean_user_text(prompt)
+
+    if not prompt:
+        send_message(
+            chat_id,
+            "Напиши, как обработать фото.",
+            main_keyboard()
+        )
+        return
+
     with state_lock:
         if chat_id in busy_chats:
             send_message(
@@ -919,34 +1503,101 @@ def start_processing(chat_id, file_id, prompt):
     threading.Thread(
         target=process_photo,
         args=(chat_id, file_id, prompt),
-        daemon=True
+        daemon=True,
+        name=f"image-{chat_id}"
     ).start()
 
 
-# =========================
-# MESSAGE HANDLER
-# =========================
+# ============================================================
+# HELP, FEATURES AND ADMIN
+# ============================================================
 
-def handle_update(update):
-    if update.get("pre_checkout_query"):
-        handle_pre_checkout(update["pre_checkout_query"])
-        return
+def help_text():
+    return (
+        "❓ Как пользоваться TovarPix\n\n"
+        "1. Отправь фотографию товара.\n"
+        "2. Напиши, что изменить: фон, свет, композицию или атмосферу.\n"
+        "3. Для рекламного дизайна отдельно попроси карточку с заголовком "
+        "и плашками.\n\n"
+        "Примеры:\n"
+        "• «Белый фон, мягкая тень, как для маркетплейса»\n"
+        "• «Премиальная тёмная студия, товар не менять»\n"
+        "• «Сделай рекламную карточку. Характеристики: матовый чехол, "
+        "защита углов»\n\n"
+        "Совет: если важны мелкие детали, прямо укажи, что их нельзя менять."
+    )
 
-    message = update.get("message")
 
-    if not message:
-        return
+def features_text():
+    return (
+        "📋 Возможности TovarPix\n\n"
+        "📸 Улучшение товарных фотографий\n"
+        "💡 Студийное освещение и реалистичные тени\n"
+        "🧱 Замена или улучшение фона\n"
+        "🛍️ Рекламные карточки с текстом, плашками и характеристиками\n"
+        "🔤 Текст рекламной карточки рисуется отдельно, чтобы он был чётким\n"
+        "💳 Оплата обработок через Telegram Stars\n\n"
+        "Важно: нейросеть может ошибаться в мелких деталях товара. "
+        "Проверяй результат перед публикацией."
+    )
 
-    chat_id = message.get("chat", {}).get("id")
 
-    if not chat_id:
-        return
+def admin_text(chat_id):
+    if not is_admin(chat_id):
+        return "Команда доступна только администратору."
 
-    if message.get("successful_payment"):
-        handle_successful_payment(message)
-        return
+    try:
+        stats = get_admin_stats()
 
-    text = (message.get("text") or "").strip()
+        with state_lock:
+            runtime = dict(runtime_stats)
+            busy_count = len(busy_chats)
+
+        events = stats["events_7d"]
+
+        event_lines = "\n".join(
+            f"• {name}: {count}"
+            for name, count in sorted(events.items())
+        ) or "• Пока нет событий"
+
+        last_error = runtime.get("last_error") or {}
+
+        return (
+            "🛠 TovarPix — админ-статистика\n\n"
+            f"👥 Пользователей: {stats['users']}\n"
+            f"⭐ Продано обработок: {stats['credits_sold']}\n"
+            f"💫 Получено Stars: {stats['stars_total']}\n"
+            f"🧾 Платежей: {stats['payment_count']}\n"
+            f"🎟 Остаток кредитов всех пользователей: "
+            f"{stats['credits_remaining']}\n\n"
+            "📈 За последние 7 дней:\n"
+            f"{event_lines}\n\n"
+            "⚙️ Текущий процесс:\n"
+            f"• Время работы: "
+            f"{format_duration(time.time() - APP_STARTED_AT)}\n"
+            f"• Обработок запущено: {runtime['images_started']}\n"
+            f"• Успешно: {runtime['images_succeeded']}\n"
+            f"• Ошибок: {runtime['images_failed']}\n"
+            f"• Рекламных карточек: {runtime['cards_rendered']}\n"
+            f"• Сейчас обрабатывается: {busy_count}\n"
+            f"• Последний успешный результат: "
+            f"{runtime['last_success_at'] or 'нет'}\n"
+            f"• Последняя ошибка: {last_error.get('message', 'нет')}"
+        )
+
+    except Exception:
+        logger.exception("Could not create admin report")
+        return (
+            "Не удалось получить статистику. "
+            "Проверь подключение к PostgreSQL."
+        )
+
+
+# ============================================================
+# COMMAND HANDLER
+# ============================================================
+
+def handle_command_or_text(chat_id, message, text):
     command = text.split("@")[0].split()[0] if text else ""
 
     if command == "/start":
@@ -960,13 +1611,12 @@ def handle_update(update):
             "Привет! 👋 Я TovarPix — AI-редактор фото товаров.\n\n"
             "📸 Отправь фотографию товара.\n"
             "✍️ Затем напиши, как её обработать.\n\n"
-            "Я могу улучшить фон и освещение, а по запросу — "
-            "оформить рекламную карточку с заголовком и плашками.\n\n"
-            "Каждому пользователю доступна одна бесплатная "
-            "обработка. Дополнительные можно купить за Telegram Stars.\n\n"
-            "Пример: «Сделай премиальный тёмный фон, мягкое "
-            "студийное освещение и реалистичную тень. "
-            "Сам товар не меняй».",
+            "Я улучшаю фон и освещение, а по отдельному запросу оформляю "
+            "рекламную карточку с заголовком и плашками.\n\n"
+            "🎁 Доступна одна бесплатная обработка.\n"
+            "⭐ Дополнительные: 5 обработок за 5 Telegram Stars.\n\n"
+            "Начни с простого: «Сделай премиальный тёмный фон, мягкий "
+            "студийный свет и реалистичную тень. Сам товар не меняй».",
             main_keyboard()
         )
         return
@@ -980,30 +1630,35 @@ def handle_update(update):
         )
         return
 
+    if command == "/help" or text == "❓ Помощь":
+        send_message(
+            chat_id,
+            help_text(),
+            main_keyboard()
+        )
+        return
+
+    if command == "/features" or text == "📋 Возможности":
+        send_message(
+            chat_id,
+            features_text(),
+            main_keyboard()
+        )
+        return
+
     if command == "/balance" or text == "💰 Баланс":
         try:
-            balance = get_balance(chat_id)
-
-            if balance["admin"]:
-                answer = "👑 У тебя безлимит."
-            else:
-                free_text = (
-                    "доступна"
-                    if not balance["free_used"]
-                    else "уже использована"
-                )
-
-                answer = (
-                    f"🎁 Бесплатная обработка: {free_text}.\n"
-                    f"⭐ Купленных обработок: {balance['credits']}."
-                )
-
-            send_message(chat_id, answer, main_keyboard())
-
+            send_message(
+                chat_id,
+                user_balance_text(get_balance(chat_id)),
+                main_keyboard()
+            )
         except Exception:
             logger.exception("Could not read balance")
-            send_message(chat_id, "Не удалось загрузить баланс.")
-
+            send_message(
+                chat_id,
+                "Не удалось загрузить баланс. Попробуй позже."
+            )
         return
 
     if command == "/buy" or text == "⭐ Купить 5 обработок":
@@ -1031,16 +1686,102 @@ def handle_update(update):
     if command == "/example" or text == "💡 Пример промпта":
         send_message(
             chat_id,
-            "Примеры описаний:\n\n"
+            "💡 Примеры описаний:\n\n"
             "• Белый фон и мягкие реалистичные тени.\n"
             "• Премиальная тёмная студия с красивым освещением.\n"
             "• Светлый интерьер и естественный дневной свет.\n"
-            "• Сделай продающую рекламную карточку с заголовком "
-            "и плашками. Используй только указанные характеристики.\n\n"
-            "Отправь своё описание обычным сообщением.",
+            "• Минималистичный фон для маркетплейса.\n"
+            "• Рекламная карточка с заголовком и плашками.\n\n"
+            "Для рекламной карточки укажи реальные характеристики товара. "
+            "Я не должен выдумывать свойства, скидки или цены.",
             main_keyboard()
         )
         return
+
+    if command == "/admin":
+        send_message(
+            chat_id,
+            admin_text(chat_id),
+            main_keyboard()
+        )
+        return
+
+    if command == "/privacy":
+        send_message(
+            chat_id,
+            "🔒 Конфиденциальность\n\n"
+            "Фото отправляется внешнему сервису обработки изображений "
+            "для выполнения твоего запроса. Не отправляй документы, "
+            "личные фото или изображения, которые не имеешь права "
+            "обрабатывать. Не используй результат как подтверждение "
+            "характеристик товара.",
+            main_keyboard()
+        )
+        return
+
+    if command == "/status":
+        try:
+            balance = get_balance(chat_id)
+
+            send_message(
+                chat_id,
+                "📊 Статус\n\n"
+                + user_balance_text(balance)
+                + "\n\n🕒 Время работы сервиса: "
+                + format_duration(time.time() - APP_STARTED_AT),
+                main_keyboard()
+            )
+
+        except Exception:
+            logger.exception("Status command failed")
+            send_message(
+                chat_id,
+                "Статус временно недоступен."
+            )
+
+        return
+
+    send_message(
+        chat_id,
+        "Не понял команду. Нажми «❓ Помощь».",
+        main_keyboard()
+    )
+
+
+# ============================================================
+# MESSAGE HANDLER
+# ============================================================
+
+def handle_update(update):
+    with state_lock:
+        runtime_stats["updates"] += 1
+
+    if update.get("pre_checkout_query"):
+        handle_pre_checkout(update["pre_checkout_query"])
+        return
+
+    message = update.get("message")
+
+    if not message:
+        return
+
+    chat_id = message.get("chat", {}).get("id")
+
+    if not chat_id:
+        return
+
+    if message.get("successful_payment"):
+        handle_successful_payment(message)
+        return
+
+    if not allow_message_rate(chat_id):
+        send_message(
+            chat_id,
+            "⏳ Слишком много сообщений подряд. Подожди немного."
+        )
+        return
+
+    text = (message.get("text") or "").strip()
 
     if message.get("photo"):
         with state_lock:
@@ -1059,8 +1800,8 @@ def handle_update(update):
             "Теперь напиши, что именно нужно сделать с ним.\n"
             "Например: «Сделай белый фон и мягкие тени, "
             "не меняя сам товар».\n\n"
-            "Для рекламного оформления напиши: «Сделай "
-            "продающую карточку товара с заголовком и плашками».\n\n"
+            "Для рекламы напиши: «Сделай продающую карточку "
+            "с заголовком и плашками».\n\n"
             "Обработка начнётся после твоего описания.",
             main_keyboard()
         )
@@ -1073,11 +1814,12 @@ def handle_update(update):
         if file_id:
             start_processing(chat_id, file_id, text)
         else:
-            send_message(
-                chat_id,
-                "Сначала отправь фото товара, затем напиши промпт.",
-                main_keyboard()
-            )
+            handle_command_or_text(chat_id, message, text)
+
+        return
+
+    if text.startswith("/"):
+        handle_command_or_text(chat_id, message, text)
         return
 
     send_message(
@@ -1087,13 +1829,43 @@ def handle_update(update):
     )
 
 
-# =========================
+# ============================================================
 # FLASK ROUTES
-# =========================
+# ============================================================
 
 @app.route("/", methods=["GET"])
 def home():
     return "TovarPix AI is running!", 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "ok": True,
+        "service": "tovarpix",
+        "uptime_seconds": int(time.time() - APP_STARTED_AT),
+        "timestamp": utc_now_iso()
+    }), 200
+
+
+@app.route("/ready", methods=["GET"])
+def ready():
+    try:
+        with db_connect() as conn:
+            conn.execute("SELECT 1")
+
+        return jsonify({
+            "ready": True,
+            "database": "ok"
+        }), 200
+
+    except Exception:
+        logger.exception("Readiness check failed")
+
+        return jsonify({
+            "ready": False,
+            "database": "error"
+        }), 503
 
 
 @app.route("/bot_info", methods=["GET"])
@@ -1114,11 +1886,28 @@ def bot_info():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    if WEBHOOK_SECRET:
+        supplied = request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token",
+            ""
+        )
+
+        if supplied != WEBHOOK_SECRET:
+            logger.warning(
+                "Rejected webhook request with invalid secret"
+            )
+            return "Forbidden", 403
+
     if not request.is_json:
         return "Expected JSON", 415
 
     try:
-        handle_update(request.get_json())
+        payload = request.get_json(silent=False)
+
+        if not isinstance(payload, dict):
+            return "Expected JSON object", 400
+
+        handle_update(payload)
         return "OK", 200
 
     except Exception:
@@ -1131,11 +1920,13 @@ def set_webhook():
     if not RENDER_URL:
         return "Render URL is not configured", 500
 
+    data = {"url": f"{RENDER_URL}/webhook"}
+
+    if WEBHOOK_SECRET:
+        data["secret_token"] = WEBHOOK_SECRET
+
     try:
-        telegram_api(
-            "setWebhook",
-            {"url": f"{RENDER_URL}/webhook"}
-        )
+        telegram_api("setWebhook", data)
         return "Webhook configured", 200
 
     except Exception:
@@ -1155,7 +1946,8 @@ def webhook_status():
             ),
             "pending_update_count": info.get("pending_update_count"),
             "last_error_date": info.get("last_error_date"),
-            "last_error_message": info.get("last_error_message")
+            "last_error_message": info.get("last_error_message"),
+            "max_connections": info.get("max_connections")
         }), 200
 
     except Exception:
@@ -1163,5 +1955,23 @@ def webhook_status():
         return jsonify({"error": "Telegram API error"}), 500
 
 
+@app.route("/runtime_stats", methods=["GET"])
+def runtime_stats_route():
+    # Public endpoint deliberately excludes user IDs, balances and secrets.
+    with state_lock:
+        stats = dict(runtime_stats)
+        stats["busy_count"] = len(busy_chats)
+
+    stats.pop("last_error", None)
+
+    return jsonify({
+        "uptime_seconds": int(time.time() - APP_STARTED_AT),
+        "stats": stats
+    }), 200
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(
+        host="0.0.0.0",
+        port=PORT
+    )
