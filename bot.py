@@ -1,4 +1,3 @@
-
 import os
 import io
 import uuid
@@ -484,7 +483,7 @@ def generate_product_image(image_bytes, user_prompt):
                 "image_file_paths": [str(input_path)]
             },
             style={"prompt": prompt},
-            model="qwen-edit",
+            model="qwen-image-2.1",
             aspect_ratio="1:1",
             resolution="640px",
             image_count=1,
