@@ -1,6 +1,9 @@
+
 import os
 import io
 import uuid
+import json
+import base64
 import logging
 import threading
 import tempfile
@@ -9,7 +12,7 @@ from pathlib import Path
 import requests
 import psycopg
 from flask import Flask, request, jsonify
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from magic_hour import Client
 
 logging.basicConfig(
@@ -20,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("BOT_TOKEN")
 MAGIC_HOUR_API_KEY = os.environ.get("MAGIC_HOUR_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
@@ -260,28 +265,21 @@ def reset_keyboard(chat_id):
 
 
 # =========================
-# PAYMENTS: TELEGRAM STARS
+# TELEGRAM STARS PAYMENTS
 # =========================
 
 def send_invoice(chat_id):
-    payload = (
-        f"tovarpix_pack5_{chat_id}_{uuid.uuid4().hex}"
-    )
+    payload = f"tovarpix_pack5_{chat_id}_{uuid.uuid4().hex}"
 
     telegram_api("sendInvoice", {
         "chat_id": chat_id,
         "title": "TovarPix — 5 обработок",
-        "description": (
-            "Пять дополнительных обработок фотографий товаров"
-        ),
+        "description": "Пять дополнительных обработок фотографий товаров",
         "payload": payload,
         "provider_token": "",
         "currency": "XTR",
         "prices": [
-            {
-                "label": "5 обработок",
-                "amount": PACKAGE_STARS
-            }
+            {"label": "5 обработок", "amount": PACKAGE_STARS}
         ]
     })
 
@@ -312,9 +310,7 @@ def handle_pre_checkout(query):
         answer_pre_checkout(
             query["id"],
             valid,
-            None if valid else (
-                "Не удалось проверить заказ. Попробуй снова."
-            )
+            None if valid else "Не удалось проверить заказ. Попробуй снова."
         )
 
     except Exception:
@@ -343,8 +339,7 @@ def handle_successful_payment(message):
         if chat_id:
             send_message(
                 chat_id,
-                "Не удалось автоматически проверить платёж. "
-                "Обратись в поддержку."
+                "Не удалось автоматически проверить платёж. Обратись в поддержку."
             )
         return
 
@@ -382,23 +377,19 @@ def handle_successful_payment(message):
                 main_keyboard()
             )
         else:
-            send_message(
-                chat_id,
-                "Этот платёж уже был учтён."
-            )
+            send_message(chat_id, "Этот платёж уже был учтён.")
 
     except Exception:
         logger.exception("Could not credit successful payment")
         send_message(
             chat_id,
-            "Платёж получен Telegram, но не удалось начислить "
-            "обработки. Не оплачивай повторно — обратись "
-            "в поддержку."
+            "Платёж получен Telegram, но не удалось начислить обработки. "
+            "Не оплачивай повторно — обратись в поддержку."
         )
 
 
 # =========================
-# IMAGE PROCESSING
+# IMAGE DOWNLOAD
 # =========================
 
 def download_telegram_photo(file_id):
@@ -413,9 +404,12 @@ def download_telegram_photo(file_id):
         timeout=45
     )
     response.raise_for_status()
-
     return response.content
 
+
+# =========================
+# QWEN IMAGE EDITOR
+# =========================
 
 BASE_PROMPT = """
 You are a professional commercial product photographer and retoucher.
@@ -471,17 +465,11 @@ def generate_product_image(image_bytes, user_prompt):
 
         with Image.open(io.BytesIO(image_bytes)) as image:
             image = image.convert("RGB")
-            image.save(
-                input_path,
-                format="JPEG",
-                quality=95
-            )
+            image.save(input_path, format="JPEG", quality=95)
 
         result = magic_client.v1.ai_image_editor.generate(
             name="TovarPix product photo",
-            assets={
-                "image_file_paths": [str(input_path)]
-            },
+            assets={"image_file_paths": [str(input_path)]},
             style={"prompt": prompt},
             model="qwen-image-2.1",
             aspect_ratio="1:1",
@@ -500,27 +488,315 @@ def generate_product_image(image_bytes, user_prompt):
                     f"Magic Hour: {error.code}: {error.message}"
                 )
 
-            raise RuntimeError(
-                f"Generation status: {result.status}"
-            )
+            raise RuntimeError(f"Generation status: {result.status}")
 
         paths = result.downloaded_paths
 
-        if (
-            not paths
-            or not Path(str(paths[0])).is_file()
-        ):
+        if not paths or not Path(str(paths[0])).is_file():
             raise RuntimeError("Generated image file not found")
 
-        output = io.BytesIO(
-            Path(str(paths[0])).read_bytes()
-        )
+        output = io.BytesIO(Path(str(paths[0])).read_bytes())
         output.seek(0)
-
         return output
 
 
+# =========================
+# GEMINI: AD TEXT GENERATION
+# =========================
+
+def get_ad_copy(image_bytes, user_prompt):
+    """
+    Gemini decides whether the user explicitly requested an ad card.
+    Returns validated text fields, or None if no card is needed.
+    """
+
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY is not configured")
+        return None
+
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image = image.convert("RGB")
+        image.thumbnail((512, 512))
+        image_buffer = io.BytesIO()
+        image.save(image_buffer, format="JPEG", quality=78)
+
+    instruction = f"""
+Ты — арт-директор интернет-магазина и копирайтер рекламных карточек.
+
+Запрос пользователя:
+{user_prompt[:1500]}
+
+Верни только JSON такого вида:
+{{
+  "make_ad_card": true,
+  "title": "Короткий заголовок",
+  "subtitle": "Короткий подзаголовок",
+  "badge": "Короткая плашка",
+  "features": ["Особенность 1", "Особенность 2"],
+  "accent": "#D9FF43"
+}}
+
+ПРАВИЛА:
+1. make_ad_card=true только если пользователь просит рекламу,
+   рекламную карточку, баннер, продающий дизайн, текст на фото,
+   плашки или характеристики товара.
+2. Если пользователь просит только заменить фон, улучшить свет,
+   повернуть предмет или ретушировать фото — make_ad_card=false.
+3. Не придумывай цену, скидку, гарантию, технические параметры,
+   комплект поставки или другие факты.
+4. В features используй только характеристики, явно указанные
+   пользователем. Если их нет, верни пустой список.
+5. Если пользователь просит рекламу, но данных мало, можно сделать
+   нейтральный заголовок без выдуманных характеристик.
+6. title — не более 34 символов.
+7. subtitle — не более 55 символов.
+8. badge — не более 18 символов.
+9. features — максимум 3 пункта, каждый до 32 символов.
+10. Пиши на русском языке.
+11. Не утверждай, что видимые детали или характеристики подтверждены,
+    если их нельзя достоверно определить по фото.
+12. accent — только один из цветов #D9FF43, #FFFFFF, #65D6FF,
+    #FFB86B или #FF7A90.
+"""
+
+    response = requests.post(
+        "https://generativelanguage.googleapis.com/v1beta/"
+        f"models/{GEMINI_MODEL}:generateContent",
+        params={"key": GEMINI_API_KEY},
+        json={
+            "contents": [{
+                "parts": [
+                    {"text": instruction},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": base64.b64encode(
+                                image_buffer.getvalue()
+                            ).decode("ascii")
+                        }
+                    }
+                ]
+            }],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0.3,
+                "maxOutputTokens": 400
+            }
+        },
+        timeout=35
+    )
+
+    response.raise_for_status()
+    body = response.json()
+
+    candidates = body.get("candidates", [])
+    if not candidates:
+        raise RuntimeError("Gemini returned no candidates")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    answer = next(
+        (part.get("text", "") for part in parts if part.get("text")),
+        ""
+    )
+
+    if not answer:
+        raise RuntimeError("Gemini returned an empty response")
+
+    answer = answer.strip()
+
+    if answer.startswith("```"):
+        answer = answer.split("\n", 1)[-1]
+        if answer.endswith("```"):
+            answer = answer[:-3].strip()
+
+    data = json.loads(answer)
+
+    if not data.get("make_ad_card"):
+        return None
+
+    allowed_accents = {
+        "#D9FF43", "#FFFFFF", "#65D6FF", "#FFB86B", "#FF7A90"
+    }
+    accent = str(data.get("accent", "#D9FF43")).upper()
+    if accent not in allowed_accents:
+        accent = "#D9FF43"
+
+    return {
+        "title": str(data.get("title", ""))[:34],
+        "subtitle": str(data.get("subtitle", ""))[:55],
+        "badge": str(data.get("badge", ""))[:18],
+        "features": [
+            str(item)[:32]
+            for item in data.get("features", [])
+            if isinstance(item, str)
+        ][:3],
+        "accent": accent
+    }
+
+
+# =========================
+# PILLOW: DRAW REAL TEXT
+# =========================
+
+def load_font(size, bold=False):
+    if bold:
+        paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
+        ]
+    else:
+        paths = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf"
+        ]
+
+    for path in paths:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+
+    return ImageFont.load_default()
+
+
+def fit_text(draw, text, font, max_width):
+    """
+    Shorten a line only if it exceeds the available width.
+    """
+    text = str(text)
+    if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+        return text
+
+    while text:
+        candidate = text.rstrip() + "…"
+        if draw.textbbox((0, 0), candidate, font=font)[2] <= max_width:
+            return candidate
+        text = text[:-1]
+
+    return ""
+
+
+def render_ad_card(image_bytes, ad):
+    with Image.open(io.BytesIO(image_bytes)) as source:
+        product_image = source.convert("RGB")
+        product_image.thumbnail((640, 640))
+
+    width, image_height = product_image.size
+    footer_height = 210
+    accent = ad.get("accent", "#D9FF43")
+
+    canvas = Image.new(
+        "RGB",
+        (width, image_height + footer_height),
+        "#17191F"
+    )
+    canvas.paste(product_image, (0, 0))
+
+    draw = ImageDraw.Draw(canvas)
+
+    title_font = load_font(25, bold=True)
+    subtitle_font = load_font(15)
+    badge_font = load_font(13, bold=True)
+    feature_font = load_font(13)
+
+    x = 18
+    y = image_height + 12
+    max_width = width - 36
+
+    badge = ad.get("badge", "").strip()
+    if badge:
+        badge_font_height = 25
+        badge_text = fit_text(draw, badge, badge_font, max_width - 22)
+        text_width = draw.textbbox((0, 0), badge_text, font=badge_font)[2]
+        pill_width = min(width - 36, text_width + 22)
+
+        draw.rounded_rectangle(
+            (x, y, x + pill_width, y + badge_font_height),
+            radius=8,
+            fill=accent
+        )
+        draw.text(
+            (x + 11, y + 5),
+            badge_text,
+            font=badge_font,
+            fill="#17191F"
+        )
+        y += 32
+
+    title = fit_text(
+        draw,
+        ad.get("title", "").strip(),
+        title_font,
+        max_width
+    )
+    if title:
+        draw.text((x, y), title, font=title_font, fill="#FFFFFF")
+        y += 34
+
+    subtitle = fit_text(
+        draw,
+        ad.get("subtitle", "").strip(),
+        subtitle_font,
+        max_width
+    )
+    if subtitle:
+        draw.text(
+            (x, y),
+            subtitle,
+            font=subtitle_font,
+            fill="#D2D4DA"
+        )
+        y += 24
+
+    features = ad.get("features", [])
+    if features and y + 20 <= image_height + footer_height - 8:
+        feature_text = "  •  ".join(features)
+        feature_text = fit_text(
+            draw, feature_text, feature_font, max_width
+        )
+        draw.text(
+            (x, y),
+            feature_text,
+            font=feature_font,
+            fill=accent
+        )
+
+    output = io.BytesIO()
+    canvas.save(output, format="JPEG", quality=92, optimize=True)
+    output.seek(0)
+    return output
+
+
+def add_ad_layout_if_requested(image_bytes, user_prompt):
+    """
+    The Qwen image is always preserved as a fallback.
+    A Gemini failure never fails the image-processing job.
+    """
+    try:
+        ad = get_ad_copy(image_bytes, user_prompt)
+
+        if not ad:
+            logger.info("Ad layout not requested; keeping Qwen image")
+            return io.BytesIO(image_bytes)
+
+        result = render_ad_card(image_bytes, ad)
+        logger.info("Gemini ad card rendered successfully")
+        return result
+
+    except Exception:
+        logger.exception("Gemini ad layout failed; using Qwen image")
+        return io.BytesIO(image_bytes)
+
+
+# =========================
+# SEND IMAGE TO TELEGRAM
+# =========================
+
 def send_generated_photo(chat_id, image_buffer):
+    image_buffer.seek(0)
+
     response = http.post(
         f"{API_URL}/sendPhoto",
         data={
@@ -542,6 +818,10 @@ def send_generated_photo(chat_id, image_buffer):
     if not response.json().get("ok"):
         raise RuntimeError("Telegram could not send result")
 
+
+# =========================
+# PROCESS USER PHOTO
+# =========================
 
 def process_photo(chat_id, file_id, prompt):
     credit_type = None
@@ -573,8 +853,18 @@ def process_photo(chat_id, file_id, prompt):
         with Image.open(io.BytesIO(image_bytes)) as image:
             image.verify()
 
+        # 1. Qwen edits the photograph.
         result = generate_product_image(image_bytes, prompt)
-        send_generated_photo(chat_id, result)
+        qwen_bytes = result.getvalue()
+
+        # 2. Gemini adds a designed ad footer only when requested.
+        # If Gemini fails, the Qwen image is sent unchanged.
+        final_result = add_ad_layout_if_requested(
+            qwen_bytes,
+            prompt
+        )
+
+        send_generated_photo(chat_id, final_result)
 
         balance = get_balance(chat_id)
 
@@ -657,10 +947,7 @@ def handle_update(update):
         return
 
     text = (message.get("text") or "").strip()
-    command = (
-        text.split("@")[0].split()[0]
-        if text else ""
-    )
+    command = text.split("@")[0].split()[0] if text else ""
 
     if command == "/start":
         try:
@@ -673,10 +960,11 @@ def handle_update(update):
             "Привет! 👋 Я TovarPix — AI-редактор фото товаров.\n\n"
             "📸 Отправь фотографию товара.\n"
             "✍️ Затем напиши, как её обработать.\n\n"
+            "Я могу улучшить фон и освещение, а по запросу — "
+            "оформить рекламную карточку с заголовком и плашками.\n\n"
             "Каждому пользователю доступна одна бесплатная "
-            "обработка. Дополнительные можно купить за "
-            "Telegram Stars.\n\n"
-            "Например: «Сделай премиальный тёмный фон, мягкое "
+            "обработка. Дополнительные можно купить за Telegram Stars.\n\n"
+            "Пример: «Сделай премиальный тёмный фон, мягкое "
             "студийное освещение и реалистичную тень. "
             "Сам товар не меняй».",
             main_keyboard()
@@ -747,7 +1035,8 @@ def handle_update(update):
             "• Белый фон и мягкие реалистичные тени.\n"
             "• Премиальная тёмная студия с красивым освещением.\n"
             "• Светлый интерьер и естественный дневной свет.\n"
-            "• Удали фон и сделай чистый белый фон.\n\n"
+            "• Сделай продающую рекламную карточку с заголовком "
+            "и плашками. Используй только указанные характеристики.\n\n"
             "Отправь своё описание обычным сообщением.",
             main_keyboard()
         )
@@ -762,9 +1051,7 @@ def handle_update(update):
                 )
                 return
 
-            pending_photos[chat_id] = (
-                message["photo"][-1]["file_id"]
-            )
+            pending_photos[chat_id] = message["photo"][-1]["file_id"]
 
         send_message(
             chat_id,
@@ -772,6 +1059,8 @@ def handle_update(update):
             "Теперь напиши, что именно нужно сделать с ним.\n"
             "Например: «Сделай белый фон и мягкие тени, "
             "не меняя сам товар».\n\n"
+            "Для рекламного оформления напиши: «Сделай "
+            "продающую карточку товара с заголовком и плашками».\n\n"
             "Обработка начнётся после твоего описания.",
             main_keyboard()
         )
@@ -864,9 +1153,7 @@ def webhook_status():
             "url_matches_render": (
                 info.get("url") == f"{RENDER_URL}/webhook"
             ),
-            "pending_update_count": (
-                info.get("pending_update_count")
-            ),
+            "pending_update_count": info.get("pending_update_count"),
             "last_error_date": info.get("last_error_date"),
             "last_error_message": info.get("last_error_message")
         }), 200
