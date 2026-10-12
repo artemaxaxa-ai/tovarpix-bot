@@ -1,11 +1,13 @@
 import os
 import io
+import uuid
 import logging
 import threading
 import tempfile
 from pathlib import Path
 
 import requests
+import psycopg
 from flask import Flask, request, jsonify
 from PIL import Image
 from magic_hour import Client
@@ -18,111 +20,374 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("BOT_TOKEN")
 MAGIC_HOUR_API_KEY = os.environ.get("MAGIC_HOUR_API_KEY")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 
+ADMIN_IDS = {
+    value.strip()
+    for value in os.environ.get("ADMIN_IDS", "").split(",")
+    if value.strip()
+}
+
+PACKAGE_IMAGES = 5
+PACKAGE_STARS = 50
+
 if not TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN")
-
 if not MAGIC_HOUR_API_KEY:
     raise RuntimeError("Не задан MAGIC_HOUR_API_KEY")
+if not DATABASE_URL:
+    raise RuntimeError("Не задан DATABASE_URL")
 
 API_URL = f"https://api.telegram.org/bot{TOKEN}"
 app = Flask(__name__)
 http = requests.Session()
-
 magic_client = Client(token=MAGIC_HOUR_API_KEY)
+
+pending_photos = {}
+busy_chats = set()
+state_lock = threading.Lock()
+
+
+def db_connect():
+    return psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=15
+    )
+
+
+def init_db():
+    with db_connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id BIGINT PRIMARY KEY,
+                free_used BOOLEAN NOT NULL DEFAULT FALSE,
+                credits INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                charge_id TEXT PRIMARY KEY,
+                telegram_id BIGINT NOT NULL,
+                credits INTEGER NOT NULL,
+                stars INTEGER NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+    logger.info("PostgreSQL database is ready")
+
+
+init_db()
+
+
+def is_admin(chat_id):
+    return str(chat_id) in ADMIN_IDS
+
+
+def ensure_user(chat_id):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO users (telegram_id) VALUES (%s) "
+            "ON CONFLICT (telegram_id) DO NOTHING",
+            (chat_id,)
+        )
+
+
+def get_balance(chat_id):
+    ensure_user(chat_id)
+
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT free_used, credits FROM users "
+            "WHERE telegram_id = %s",
+            (chat_id,)
+        ).fetchone()
+
+    return {
+        "free_used": row[0],
+        "credits": row[1],
+        "admin": is_admin(chat_id)
+    }
+
+
+def reserve_credit(chat_id):
+    """Reserve one free or paid image. Admins are unlimited."""
+    if is_admin(chat_id):
+        ensure_user(chat_id)
+        return "admin"
+
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO users (telegram_id) VALUES (%s) "
+            "ON CONFLICT (telegram_id) DO NOTHING",
+            (chat_id,)
+        )
+
+        row = conn.execute(
+            "SELECT free_used, credits FROM users "
+            "WHERE telegram_id = %s FOR UPDATE",
+            (chat_id,)
+        ).fetchone()
+
+        free_used, credits = row
+
+        if not free_used:
+            conn.execute(
+                "UPDATE users SET free_used = TRUE "
+                "WHERE telegram_id = %s",
+                (chat_id,)
+            )
+            return "free"
+
+        if credits > 0:
+            conn.execute(
+                "UPDATE users SET credits = credits - 1 "
+                "WHERE telegram_id = %s",
+                (chat_id,)
+            )
+            return "paid"
+
+        return None
+
+
+def refund_credit(chat_id, credit_type):
+    """Restore a credit if processing fails."""
+    if credit_type == "admin" or not credit_type:
+        return
+
+    with db_connect() as conn:
+        if credit_type == "free":
+            conn.execute(
+                "UPDATE users SET free_used = FALSE "
+                "WHERE telegram_id = %s",
+                (chat_id,)
+            )
+        elif credit_type == "paid":
+            conn.execute(
+                "UPDATE users SET credits = credits + 1 "
+                "WHERE telegram_id = %s",
+                (chat_id,)
+            )
 
 
 def telegram_api(method, data=None):
-    try:
-        response = http.post(
-            f"{API_URL}/{method}",
-            json=data or {},
-            timeout=30
-        )
-        response.raise_for_status()
-        result = response.json()
+    response = http.post(
+        f"{API_URL}/{method}",
+        json=data or {},
+        timeout=35
+    )
+    response.raise_for_status()
+    result = response.json()
 
-        if not result.get("ok"):
-            raise RuntimeError(
-                result.get("description", "Ошибка Telegram API")
-            )
-
-        return result.get("result")
-
-    except Exception:
+    if not result.get("ok"):
         raise RuntimeError(
-            f"Ошибка при обращении к Telegram API: {method}"
-        ) from None
+            result.get("description", "Telegram API error")
+        )
+
+    return result.get("result")
 
 
-def send_message(chat_id, text):
+def send_message(chat_id, text, reply_markup=None):
+    data = {
+        "chat_id": chat_id,
+        "text": text
+    }
+
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+
     try:
-        telegram_api("sendMessage", {
-            "chat_id": chat_id,
-            "text": text
-        })
+        telegram_api("sendMessage", data)
     except Exception:
-        logger.error("Не удалось отправить сообщение в чат %s", chat_id)
+        logger.exception("Could not send Telegram message")
+
+
+def main_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "⭐ Купить 5 обработок"}],
+            [{"text": "💡 Пример промпта"}, {"text": "💰 Баланс"}],
+            [{"text": "❌ Отмена"}]
+        ],
+        "resize_keyboard": True
+    }
+
+
+def send_invoice(chat_id):
+    payload = f"tovarpix_pack5_{chat_id}_{uuid.uuid4().hex}"
+
+    telegram_api("sendInvoice", {
+        "chat_id": chat_id,
+        "title": "TovarPix — 5 обработок",
+        "description": "Пять дополнительных обработок фотографий товаров",
+        "payload": payload,
+        "provider_token": "",
+        "currency": "XTR",
+        "prices": [
+            {
+                "label": "5 обработок",
+                "amount": PACKAGE_STARS
+            }
+        ]
+    })
+
+
+def answer_pre_checkout(query_id, ok, error_message=None):
+    data = {
+        "pre_checkout_query_id": query_id,
+        "ok": ok
+    }
+
+    if error_message:
+        data["error_message"] = error_message
+
+    telegram_api("answerPreCheckoutQuery", data)
+
+
+def handle_pre_checkout(query):
+    try:
+        payload = query.get("invoice_payload", "")
+        sender_id = query.get("from", {}).get("id")
+        valid = (
+            payload.startswith(f"tovarpix_pack5_{sender_id}_")
+            and query.get("currency") == "XTR"
+            and query.get("total_amount") == PACKAGE_STARS
+        )
+
+        answer_pre_checkout(
+            query["id"],
+            valid,
+            None if valid else "Не удалось проверить заказ. Попробуй снова."
+        )
+    except Exception:
+        logger.exception("Pre-checkout validation failed")
+
+
+def handle_successful_payment(message):
+    payment = message.get("successful_payment", {})
+    chat_id = message.get("chat", {}).get("id")
+    payload = payment.get("invoice_payload", "")
+    charge_id = payment.get("telegram_payment_charge_id")
+    amount = payment.get("total_amount")
+    currency = payment.get("currency")
+
+    expected_prefix = f"tovarpix_pack5_{chat_id}_"
+
+    if (
+        not chat_id
+        or not charge_id
+        or not payload.startswith(expected_prefix)
+        or currency != "XTR"
+        or amount != PACKAGE_STARS
+    ):
+        logger.error("Payment validation failed")
+        if chat_id:
+            send_message(
+                chat_id,
+                "Не удалось автоматически проверить платёж. "
+                "Обратись в поддержку."
+            )
+        return
+
+    try:
+        with db_connect() as conn:
+            inserted = conn.execute(
+                """
+                INSERT INTO payments
+                    (charge_id, telegram_id, credits, stars)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (charge_id) DO NOTHING
+                RETURNING charge_id
+                """,
+                (charge_id, chat_id, PACKAGE_IMAGES, amount)
+            ).fetchone()
+
+            if inserted:
+                conn.execute(
+                    """
+                    INSERT INTO users (telegram_id, credits)
+                    VALUES (%s, %s)
+                    ON CONFLICT (telegram_id)
+                    DO UPDATE SET credits = users.credits + EXCLUDED.credits
+                    """,
+                    (chat_id, PACKAGE_IMAGES)
+                )
+
+        if inserted:
+            send_message(
+                chat_id,
+                "✅ Оплата получена!\n\n"
+                f"Начислено: {PACKAGE_IMAGES} обработок.\n"
+                "Отправь фотографию товара, чтобы начать.",
+                main_keyboard()
+            )
+        else:
+            send_message(chat_id, "Этот платёж уже был учтён.")
+
+    except Exception:
+        logger.exception("Could not credit successful payment")
+        send_message(
+            chat_id,
+            "Платёж получен Telegram, но не удалось начислить обработки. "
+            "Не оплачивай повторно — обратись в поддержку."
+        )
 
 
 def download_telegram_photo(file_id):
-    file_info = telegram_api("getFile", {"file_id": file_id})
-    file_path = file_info.get("file_path")
+    info = telegram_api("getFile", {"file_id": file_id})
+    file_path = info.get("file_path")
 
     if not file_path:
-        raise RuntimeError("Telegram не вернул путь к фотографии")
+        raise RuntimeError("Telegram did not return file path")
 
-    url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
-
-    try:
-        response = http.get(url, timeout=40)
-        response.raise_for_status()
-        return response.content
-    except Exception:
-        raise RuntimeError("Не удалось скачать фотографию") from None
-
-
-def generate_product_image(image_bytes, user_caption=""):
-    prompt = (
-        "Edit this product photograph for a professional e-commerce "
-        "listing on a Russian marketplace such as Wildberries or Ozon. "
-        "Preserve the exact identity, shape, proportions, color, "
-        "material, details, branding, labels and text of the original "
-        "product. Do not replace, redesign or invent the product. "
-        "Improve the background, lighting, soft shadows, composition "
-        "and studio-photo quality. Make the result realistic, clean "
-        "and attractive for a product listing. Keep the product "
-        "clearly visible. Do not add text, logos, prices or promotional "
-        "graphics. Keep the result square."
+    response = http.get(
+        f"https://api.telegram.org/file/bot{TOKEN}/{file_path}",
+        timeout=45
     )
+    response.raise_for_status()
+    return response.content
 
-    if user_caption.strip():
-        prompt += (
-            "\nAdditional user instructions: "
-            + user_caption.strip()[:500]
-        )
+
+BASE_PROMPT = """
+Edit the provided product photograph according to the user's instructions.
+
+Preserve the exact identity, model, shape, proportions, colors,
+materials, buttons, camera layout, ports, labels, branding and
+all other physical details of the original product.
+Do not invent, remove, rearrange or redesign product features.
+Do not change logos or text on the product.
+
+Follow the requested background, lighting, shadows, composition
+and photographic style. Do not default to a gray background unless
+the user specifically asks for one.
+
+Create a realistic, polished product photograph suitable for
+an e-commerce marketplace. Avoid distorted geometry, artifacts,
+watermarks, prices and promotional text. Keep the product clearly visible.
+"""
+
+
+def generate_product_image(image_bytes, user_prompt):
+    prompt = (
+        BASE_PROMPT
+        + "\nUSER INSTRUCTIONS:\n"
+        + user_prompt[:1500]
+    )
 
     with tempfile.TemporaryDirectory() as temp_dir:
         input_path = Path(temp_dir) / "input.jpg"
 
         with Image.open(io.BytesIO(image_bytes)) as image:
-            if image.mode not in ("RGB", "L"):
-                image = image.convert("RGB")
-            elif image.mode == "L":
-                image = image.convert("RGB")
-
+            image = image.convert("RGB")
             image.save(input_path, format="JPEG", quality=95)
 
         result = magic_client.v1.ai_image_editor.generate(
             name="TovarPix product photo",
-            assets={
-                "image_file_paths": [str(input_path)]
-            },
-            style={
-                "prompt": prompt
-            },
+            assets={"image_file_paths": [str(input_path)]},
+            style={"prompt": prompt},
             model="qwen-edit",
             aspect_ratio="1:1",
             resolution="640px",
@@ -138,137 +403,277 @@ def generate_product_image(image_bytes, user_caption=""):
                 raise RuntimeError(
                     f"Magic Hour: {error.code}: {error.message}"
                 )
-            raise RuntimeError(
-                f"Обработка не завершена. Статус: {result.status}"
-            )
+            raise RuntimeError(f"Generation status: {result.status}")
 
-        output_paths = result.downloaded_paths
+        paths = result.downloaded_paths
 
-        if not output_paths:
-            raise RuntimeError("Magic Hour не вернул готовое изображение")
+        if not paths or not Path(str(paths[0])).is_file():
+            raise RuntimeError("Generated image file not found")
 
-        output_path = Path(str(output_paths[0]))
-
-        if not output_path.is_file():
-            raise RuntimeError("Не найден файл результата")
-
-        output = io.BytesIO(output_path.read_bytes())
+        output = io.BytesIO(Path(str(paths[0])).read_bytes())
         output.seek(0)
         return output
 
 
 def send_generated_photo(chat_id, image_buffer):
+    response = http.post(
+        f"{API_URL}/sendPhoto",
+        data={
+            "chat_id": str(chat_id),
+            "caption": "✅ Готово! Вот твоё обработанное фото."
+        },
+        files={
+            "photo": (
+                "tovarpix_result.jpg",
+                image_buffer,
+                "image/jpeg"
+            )
+        },
+        timeout=60
+    )
+    response.raise_for_status()
+
+    if not response.json().get("ok"):
+        raise RuntimeError("Telegram could not send result")
+
+
+def process_photo(chat_id, file_id, prompt):
+    credit_type = None
+    success = False
+
     try:
-        response = http.post(
-            f"{API_URL}/sendPhoto",
-            data={"chat_id": str(chat_id)},
-            files={
-                "photo": (
-                    "tovarpix_result.jpg",
-                    image_buffer,
-                    "image/jpeg"
-                )
-            },
-            timeout=60
-        )
-        response.raise_for_status()
+        credit_type = reserve_credit(chat_id)
 
-        if not response.json().get("ok"):
-            raise RuntimeError("Telegram не принял готовое изображение")
+        if credit_type is None:
+            balance = get_balance(chat_id)
 
-    except Exception:
-        raise RuntimeError(
-            "Не удалось отправить результат в Telegram"
-        ) from None
+            send_message(
+                chat_id,
+                "🎁 Твоя бесплатная обработка уже использована, "
+                "а купленные обработки закончились.\n\n"
+                "Купи пакет из 5 обработок за 50 ⭐, "
+                "чтобы продолжить.",
+                main_keyboard()
+            )
+            return
 
-
-def process_photo(chat_id, file_id, caption=""):
-    try:
         send_message(
             chat_id,
-            "🎨 Получил фото! Начинаю обработку нейросетью. "
-            "Обычно это занимает от нескольких секунд до нескольких минут."
+            "🎨 Принял описание! Обрабатываю фотографию.\n"
+            "Это может занять несколько минут."
         )
 
         image_bytes = download_telegram_photo(file_id)
 
         if len(image_bytes) > 20 * 1024 * 1024:
-            send_message(
-                chat_id,
-                "Фото слишком большое. Попробуй отправить изображение "
-                "меньшего размера."
-            )
-            return
+            raise RuntimeError("Фото больше 20 МБ")
 
-        try:
-            with Image.open(io.BytesIO(image_bytes)) as image:
-                image.verify()
-        except Exception:
-            send_message(
-                chat_id,
-                "Не удалось прочитать изображение. Попробуй другое фото."
-            )
-            return
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image.verify()
 
-        result = generate_product_image(image_bytes, caption)
+        result = generate_product_image(image_bytes, prompt)
         send_generated_photo(chat_id, result)
+        success = True
 
-        logger.info("Изображение успешно обработано")
+        balance = get_balance(chat_id)
 
-    except Exception as error:
-        logger.error(
-            "Обработка изображения завершилась ошибкой: %s",
-            str(error)[:500]
-        )
+        if balance["admin"]:
+            balance_text = "У тебя безлимит."
+        else:
+            balance_text = (
+                f"Купленных обработок осталось: {balance['credits']}."
+            )
 
         send_message(
             chat_id,
-            "😕 Не удалось обработать фото.\n\n"
-            "Возможные причины: закончились кредиты Magic Hour, "
-            "временная ошибка сервиса или проблема с изображением.\n\n"
-            "Попробуй позже. Если ошибка повторится, проверим логи Render."
+            balance_text + "\n\nМожешь отправить следующее фото.",
+            main_keyboard()
         )
+
+    except Exception:
+        logger.exception("Image processing failed")
+
+        if credit_type:
+            try:
+                refund_credit(chat_id, credit_type)
+            except Exception:
+                logger.exception("Credit refund failed")
+
+        send_message(
+            chat_id,
+            "😕 Не удалось обработать фото. "
+            "Если обработка не завершилась, лимит будет восстановлен, "
+            "если база данных доступна.\n\nПопробуй позже.",
+            main_keyboard()
+        )
+
+    finally:
+        with state_lock:
+            busy_chats.discard(chat_id)
+
+
+def start_processing(chat_id, file_id, prompt):
+    with state_lock:
+        if chat_id in busy_chats:
+            send_message(
+                chat_id,
+                "⏳ Предыдущая фотография ещё обрабатывается. "
+                "Дождись результата."
+            )
+            return
+
+        busy_chats.add(chat_id)
+
+    threading.Thread(
+        target=process_photo,
+        args=(chat_id, file_id, prompt),
+        daemon=True
+    ).start()
 
 
 def handle_update(update):
-    message = update.get("message")
+    if update.get("pre_checkout_query"):
+        handle_pre_checkout(update["pre_checkout_query"])
+        return
 
+    message = update.get("message")
     if not message:
         return
 
     chat_id = message.get("chat", {}).get("id")
-
     if not chat_id:
         return
 
-    text = message.get("text", "")
-    command = text.split("@")[0].strip()
+    if message.get("successful_payment"):
+        handle_successful_payment(message)
+        return
+
+    text = (message.get("text") or "").strip()
+    command = text.split("@")[0].split()[0] if text else ""
 
     if command == "/start":
         send_message(
             chat_id,
-            "Привет! 👋 Я Генератор Изображений AI!\n\n"
-            "Я помогу подготовить фотографии товаров "
-            "для Wildberries и Ozon.\n\n"
-            "📸 Отправь фотографию товара, чтобы начать!"
+            "Привет! 👋 Я TovarPix — AI-редактор фото товаров.\n\n"
+            "📸 Отправь фотографию товара.\n"
+            "✍️ Затем напиши, как её обработать.\n\n"
+            "Каждому пользователю доступна одна бесплатная обработка. "
+            "Дополнительные можно купить за Telegram Stars.\n\n"
+            "Например: «Сделай премиальный тёмный фон, "
+            "мягкое студийное освещение и реалистичную тень. "
+            "Сам товар не меняй».",
+            main_keyboard()
+        )
+        return
+
+    if command == "/myid":
+        send_message(
+            chat_id,
+            f"Твой Telegram ID: {chat_id}\n"
+            "Добавь его в Render в переменную ADMIN_IDS, "
+            "чтобы получить безлимит."
+        )
+        return
+
+    if command == "/balance" or text == "💰 Баланс":
+        try:
+            balance = get_balance(chat_id)
+
+            if balance["admin"]:
+                answer = "👑 У тебя безлимит."
+            else:
+                free_text = (
+                    "доступна"
+                    if not balance["free_used"]
+                    else "уже использована"
+                )
+                answer = (
+                    f"🎁 Бесплатная обработка: {free_text}.\n"
+                    f"⭐ Купленных обработок: {balance['credits']}."
+                )
+
+            send_message(chat_id, answer, main_keyboard())
+
+        except Exception:
+            logger.exception("Could not read balance")
+            send_message(chat_id, "Не удалось загрузить баланс.")
+        return
+
+    if command == "/buy" or text == "⭐ Купить 5 обработок":
+        try:
+            send_invoice(chat_id)
+        except Exception:
+            logger.exception("Could not send invoice")
+            send_message(
+                chat_id,
+                "Не удалось создать счёт. Попробуй позже."
+            )
+        return
+
+    if command == "/cancel" or text == "❌ Отмена":
+        with state_lock:
+            pending_photos.pop(chat_id, None)
+
+        send_message(
+            chat_id,
+            "Ожидание отменено. Можешь отправить новое фото.",
+            main_keyboard()
+        )
+        return
+
+    if command == "/example" or text == "💡 Пример промпта":
+        send_message(
+            chat_id,
+            "Примеры описаний:\n\n"
+            "• Белый фон и мягкие реалистичные тени.\n"
+            "• Премиальная тёмная студия с красивым освещением.\n"
+            "• Светлый интерьер и естественный дневной свет.\n"
+            "• Удали фон и сделай чистый белый фон.\n\n"
+            "Отправь своё описание обычным сообщением.",
+            main_keyboard()
         )
         return
 
     if message.get("photo"):
-        photo = message["photo"][-1]
-        caption = message.get("caption", "")
+        if chat_id in busy_chats:
+            send_message(
+                chat_id,
+                "⏳ Дождись завершения предыдущей обработки."
+            )
+            return
 
-        worker = threading.Thread(
-            target=process_photo,
-            args=(chat_id, photo["file_id"], caption),
-            daemon=True
+        with state_lock:
+            pending_photos[chat_id] = message["photo"][-1]["file_id"]
+
+        send_message(
+            chat_id,
+            "📸 Фото получил!\n\n"
+            "Теперь напиши, что именно нужно сделать с ним.\n"
+            "Например: «Сделай белый фон и мягкие тени, "
+            "не меняя сам товар».\n\n"
+            "Обработка начнётся после твоего описания.",
+            main_keyboard()
         )
-        worker.start()
+        return
+
+    if text and not text.startswith("/"):
+        with state_lock:
+            file_id = pending_photos.pop(chat_id, None)
+
+        if file_id:
+            start_processing(chat_id, file_id, text)
+        else:
+            send_message(
+                chat_id,
+                "Сначала отправь фото товара, затем напиши промпт.",
+                main_keyboard()
+            )
         return
 
     send_message(
         chat_id,
-        "Отправь /start или фотографию товара 📸"
+        "Отправь фотографию товара, чтобы начать.",
+        main_keyboard()
     )
 
 
@@ -287,10 +692,8 @@ def bot_info():
             "id": me.get("id")
         }), 200
     except Exception:
-        logger.error("Ошибка получения информации о боте")
-        return jsonify({
-            "error": "Не удалось получить информацию о боте"
-        }), 500
+        logger.exception("Bot info failed")
+        return jsonify({"error": "Telegram API error"}), 500
 
 
 @app.route("/webhook", methods=["POST"])
@@ -299,11 +702,10 @@ def webhook():
         return "Expected JSON", 415
 
     try:
-        update = request.get_json()
-        handle_update(update)
+        handle_update(request.get_json())
         return "OK", 200
     except Exception:
-        logger.exception("Ошибка обработки обновления")
+        logger.exception("Webhook handler failed")
         return "Internal Server Error", 500
 
 
@@ -316,10 +718,9 @@ def set_webhook():
         telegram_api("setWebhook", {
             "url": f"{RENDER_URL}/webhook"
         })
-        logger.info("Webhook установлен")
         return "Webhook configured", 200
     except Exception:
-        logger.error("Ошибка установки webhook")
+        logger.exception("Webhook setup failed")
         return "Webhook setup error", 500
 
 
@@ -337,12 +738,9 @@ def webhook_status():
             "last_error_message": info.get("last_error_message")
         }), 200
     except Exception:
-        logger.error("Ошибка проверки webhook")
-        return jsonify({
-            "error": "Не удалось проверить webhook"
-        }), 500
+        logger.exception("Webhook status failed")
+        return jsonify({"error": "Telegram API error"}), 500
 
 
 if __name__ == "__main__":
-    logger.info("Запуск TovarPix AI")
     app.run(host="0.0.0.0", port=PORT)
