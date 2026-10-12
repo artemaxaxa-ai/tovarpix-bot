@@ -5,3 +5,4 @@ requests
 huggingface_hub
 Pillow
 magic_hour
+psycopg[binary]
