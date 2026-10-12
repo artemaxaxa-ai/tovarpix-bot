@@ -1,3 +1,6 @@
 pyTelegramBotAPI
 Flask
 gunicorn
+requests
+huggingface_hub
+Pillow
