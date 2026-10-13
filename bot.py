@@ -1,4 +1,3 @@
-
 import os
 import io
 import uuid
@@ -173,7 +172,6 @@ CARD_ROLES = [
     "финальная презентация товара",
 ]
 
-# Текст размещается в разных допустимых зонах шаблона.
 POSITION_OPTIONS = {
     "bottom": "Снизу",
     "top": "Сверху",
@@ -932,7 +930,6 @@ def add_text_block(canvas, text, style, position, card_index, total_cards):
     if body_lines:
         block_height += gap + len(body_lines) * body_line_height
 
-    # Keep all text inside the image bounds.
     block_height = min(block_height, height - margin * 2)
     block_width = max_block_width
 
@@ -957,7 +954,6 @@ def add_text_block(canvas, text, style, position, card_index, total_cards):
         y0 = max(margin, (height - block_height) // 2)
         y1 = y0 + block_height
 
-    # Style-specific text panels.
     if kind == "minimal":
         rounded_panel(draw, (x0, y0, x1, y1), "#FFFFFF", "#D7DDD7", 24, 2)
     elif kind == "luxury":
@@ -1031,7 +1027,6 @@ def render_ad_card(
     width, height = 1080, 1350
     kind = style["kind"]
 
-    # Main product image fills the canvas; no fixed lower footer panel.
     product_image = ImageOps.fit(
         product_image,
         (width, height),
@@ -1040,7 +1035,6 @@ def render_ad_card(
     )
     canvas = product_image.convert("RGB")
 
-    # A subtle style-specific overlay, not a replacement background.
     overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
 
@@ -1066,7 +1060,6 @@ def render_ad_card(
     elif kind == "info":
         od.rounded_rectangle((25, 25, width - 25, height - 25), radius=28, outline=(184, 203, 227, 210), width=3)
     elif kind == "cinematic":
-        # Gentle darkening at top and bottom for cinematic contrast.
         for y in range(250):
             alpha = int(100 * (1 - y / 250))
             od.line((0, y, width, y), fill=(0, 0, 0, alpha))
@@ -1077,7 +1070,6 @@ def render_ad_card(
     if text and position != "none":
         canvas = add_text_block(canvas, text, style, position, card_index, total_cards)
 
-    # Small card index is deliberately outside the main text panel.
     draw = ImageDraw.Draw(canvas)
     index_font = load_font(17, True)
     index_text = f"{card_index}/{total_cards}"
@@ -1249,7 +1241,6 @@ def process_photo(chat_id, file_ids, prompt, style_id, cards):
             f"style={style_id};count={card_count};{type(exc).__name__}",
         )
 
-        # Refund only if no image was delivered.
         if credit_type and sent_count == 0:
             try:
                 refund_credit(chat_id, credit_type)
@@ -1472,7 +1463,7 @@ def handle_command_or_text(chat_id, message, text):
 
 
 # ============================================================
-# CALLBACKS
+# CALLBACKS — ИСПРАВЛЕН ПЕРЕХОД МЕЖДУ КАРТОЧКАМИ
 # ============================================================
 
 def handle_callback_query(callback):
@@ -1538,7 +1529,10 @@ def handle_callback_query(callback):
             job["stage"] = "count"
             pending_jobs[chat_id] = job
 
-        answer_callback_query(callback_id, f"Выбран стиль: {STYLE_OPTIONS[style_id]['name']}")
+        answer_callback_query(
+            callback_id,
+            f"Выбран стиль: {STYLE_OPTIONS[style_id]['name']}",
+        )
         send_message(
             chat_id,
             f"Выбран стиль: {STYLE_OPTIONS[style_id]['emoji']} "
@@ -1581,49 +1575,72 @@ def handle_callback_query(callback):
         return
 
     if data.startswith("position:"):
-        if job.get("stage") != "card_position":
-            answer_callback_query(callback_id, "Эта кнопка сейчас недоступна")
-            return
-
         position = data.split(":", 1)[1]
         if position not in ("top", "bottom", "left", "right", "none"):
             answer_callback_query(callback_id, "Неизвестное положение")
             return
 
-        index = safe_int(job.get("card_index"), 0)
-        cards = job.get("cards", [])
+        with state_lock:
+            job = pending_jobs.get(chat_id)
 
-        if index < 0 or index >= len(cards):
-            answer_callback_query(callback_id, "Карточка не найдена")
-            return
+            if not job or job.get("stage") != "card_position":
+                answer_callback_query(callback_id, "Эта кнопка сейчас недоступна")
+                return
 
-        cards[index]["position"] = position
-        job["card_index"] = index + 1
+            index = safe_int(job.get("card_index"), 0)
+            cards = job.get("cards", [])
+            card_count = safe_int(job.get("card_count"), 0)
 
-        if job["card_index"] >= job["card_count"]:
+            if index < 0 or index >= len(cards):
+                answer_callback_query(callback_id, "Карточка не найдена")
+                return
+
+            # Сохраняем положение текста текущей карточки.
+            cards[index]["position"] = position
+
+            # Переходим к следующей карточке.
+            next_index = index + 1
+            job["card_index"] = next_index
+
+            if next_index < card_count:
+                # ГЛАВНОЕ ИСПРАВЛЕНИЕ:
+                # сначала просим текст следующей карточки,
+                # а уже после текста показываем кнопки положения.
+                job["stage"] = "card_text"
+                pending_jobs[chat_id] = job
+
+                answer_callback_query(callback_id, "Положение сохранено")
+                send_message(
+                    chat_id,
+                    f"✅ Карточка {index + 1}/{card_count}: положение сохранено.\n\n"
+                    f"✍️ Теперь напиши текст для карточки {next_index + 1}/{card_count}.\n"
+                    "Можно написать заголовок и характеристики с новой строки.\n\n"
+                    "Если текст не нужен, напиши «Без текста»."
+                )
+                return
+
+            # Все карточки настроены — запускаем обработку.
+            completed_cards = [dict(card) for card in cards]
+            prompt = job.get("prompt", "")
+            style_id = job.get("style_id")
+            file_ids = list(pending_photos.get(chat_id, []))
+
             pending_jobs.pop(chat_id, None)
             pending_photos.pop(chat_id, None)
-            prompt = job.get("prompt", "")
-            style_id = job["style_id"]
-            completed_cards = list(cards)
-            answer_callback_query(callback_id, "Настройки сохранены")
-            send_message(
-                chat_id,
-                "✅ Настройки всех карточек готовы!\n\n"
-                "Начинаю обработку фотографий. Не отправляй новые фото, пока комплект не закончится.",
-            )
-            start_processing(
-                chat_id, file_ids, prompt, style_id, completed_cards
-            )
-        else:
-            next_index = job["card_index"] + 1
-            pending_jobs[chat_id] = job
-            answer_callback_query(callback_id, "Положение сохранено")
-            send_message(
-                chat_id,
-                f"📍 Карточка {next_index}/{job['card_count']}: выбери положение текста.",
-                position_keyboard(),
-            )
+
+        answer_callback_query(callback_id, "Настройки сохранены")
+        send_message(
+            chat_id,
+            "✅ Настройки всех карточек готовы!\n\n"
+            "Начинаю обработку фотографий. Не отправляй новые фото, пока комплект не закончится.",
+        )
+        start_processing(
+            chat_id,
+            file_ids,
+            prompt,
+            style_id,
+            completed_cards,
+        )
         return
 
     answer_callback_query(callback_id, "Кнопка устарела")
@@ -1731,6 +1748,8 @@ def handle_update(update):
                 card_number = 0
                 card_count = 0
 
+            # Получаем текст для очередной карточки.
+            # Индекс card_index указывает на карточку, которую сейчас настраиваем.
             if stage == "card_text" and file_ids:
                 card_number = safe_int(job.get("card_index"), 0) + 1
                 card_count = safe_int(job.get("card_count"), 0)
@@ -1877,7 +1896,6 @@ def webhook():
         if not isinstance(payload, dict):
             return "Expected JSON object", 400
 
-        # Telegram may retry an update. Deduplicate updates with update_id.
         update_id = payload.get("update_id")
         if update_id is not None:
             with db_connect() as conn:
