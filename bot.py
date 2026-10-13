@@ -15,12 +15,16 @@ from collections import defaultdict, deque
 import requests
 import psycopg
 from flask import Flask, request, jsonify
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFile
 from magic_hour import Client
+
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("tovarpix")
 
@@ -32,15 +36,18 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
+ADMIN_ENDPOINT_SECRET = os.environ.get("ADMIN_ENDPOINT_SECRET", "").strip()
+
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(20 * 1024 * 1024)))
 MAX_IMAGE_SIDE = int(os.environ.get("MAX_IMAGE_SIDE", "8000"))
+MAX_IMAGE_PIXELS = int(os.environ.get("MAX_IMAGE_PIXELS", "50000000"))
 RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "30"))
 RATE_LIMIT_MESSAGES = int(os.environ.get("RATE_LIMIT_MESSAGES", "12"))
 
 ADMIN_IDS = {
-    value.strip()
-    for value in os.environ.get("ADMIN_IDS", "").split(",")
-    if value.strip()
+    item.strip()
+    for item in os.environ.get("ADMIN_IDS", "").split(",")
+    if item.strip()
 }
 
 PACKAGE_IMAGES = 5
@@ -62,133 +69,86 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 
 http = requests.Session()
-http.headers.update({"User-Agent": "TovarPix/3.0"})
+http.headers.update({"User-Agent": "TovarPix/3.1"})
 magic_client = Client(token=MAGIC_HOUR_API_KEY)
 
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+ImageFile.LOAD_TRUNCATED_IMAGES = False
+
 # ============================================================
-# 10 СТИЛЕЙ
+# 10 ВИЗУАЛЬНЫХ СТИЛЕЙ
 # ============================================================
 
 STYLE_OPTIONS = {
     "minimal": {
-        "name": "Чистый минимализм",
-        "emoji": "▫️",
+        "name": "Чистый минимализм", "emoji": "▫️",
         "description": "Светлый фон, чистая композиция",
-        "top": "#F4F4F0",
-        "bottom": "#E3E5E1",
-        "panel": "#FFFFFF",
-        "text": "#202421",
-        "muted": "#606963",
-        "accent": "#2C7A62",
-        "kind": "minimal",
+        "top": "#F4F4F0", "bottom": "#E3E5E1",
+        "panel": "#FFFFFF", "text": "#202421",
+        "muted": "#606963", "accent": "#2C7A62", "kind": "minimal",
     },
     "luxury": {
-        "name": "Luxury",
-        "emoji": "✨",
+        "name": "Luxury", "emoji": "✨",
         "description": "Чёрный фон и золотые акценты",
-        "top": "#24211D",
-        "bottom": "#090909",
-        "panel": "#151310",
-        "text": "#FFF8E8",
-        "muted": "#C7BDA8",
-        "accent": "#D7B56D",
-        "kind": "luxury",
+        "top": "#24211D", "bottom": "#090909",
+        "panel": "#151310", "text": "#FFF8E8",
+        "muted": "#C7BDA8", "accent": "#D7B56D", "kind": "luxury",
     },
     "cozy": {
-        "name": "Домашний уют",
-        "emoji": "🏡",
+        "name": "Домашний уют", "emoji": "🏡",
         "description": "Тёплые кремовые оттенки",
-        "top": "#F7E9D5",
-        "bottom": "#E9D1B3",
-        "panel": "#FFF7EA",
-        "text": "#4A3528",
-        "muted": "#876E5B",
-        "accent": "#B56C43",
-        "kind": "cozy",
+        "top": "#F7E9D5", "bottom": "#E9D1B3",
+        "panel": "#FFF7EA", "text": "#4A3528",
+        "muted": "#876E5B", "accent": "#B56C43", "kind": "cozy",
     },
     "market": {
-        "name": "Яркий маркетплейс",
-        "emoji": "🛍️",
+        "name": "Яркий маркетплейс", "emoji": "🛍️",
         "description": "Контрастная коммерческая подача",
-        "top": "#FFF4DF",
-        "bottom": "#FFD7B5",
-        "panel": "#FFFFFF",
-        "text": "#20202A",
-        "muted": "#5C5B68",
-        "accent": "#F05A28",
-        "kind": "market",
+        "top": "#FFF4DF", "bottom": "#FFD7B5",
+        "panel": "#FFFFFF", "text": "#20202A",
+        "muted": "#5C5B68", "accent": "#F05A28", "kind": "market",
     },
     "tech": {
-        "name": "Tech",
-        "emoji": "🔷",
+        "name": "Tech", "emoji": "🔷",
         "description": "Графит, синий свет и техническая сетка",
-        "top": "#172A3A",
-        "bottom": "#080F1A",
-        "panel": "#111D2A",
-        "text": "#F2F8FF",
-        "muted": "#A9C0D4",
-        "accent": "#65D6FF",
-        "kind": "tech",
+        "top": "#172A3A", "bottom": "#080F1A",
+        "panel": "#111D2A", "text": "#F2F8FF",
+        "muted": "#A9C0D4", "accent": "#65D6FF", "kind": "tech",
     },
     "eco": {
-        "name": "Эко и натуральность",
-        "emoji": "🌿",
+        "name": "Эко и натуральность", "emoji": "🌿",
         "description": "Природные зелёные и песочные оттенки",
-        "top": "#E8EBDD",
-        "bottom": "#C8D4B8",
-        "panel": "#F7F6E9",
-        "text": "#26392B",
-        "muted": "#5E725F",
-        "accent": "#4C8058",
-        "kind": "eco",
+        "top": "#E8EBDD", "bottom": "#C8D4B8",
+        "panel": "#F7F6E9", "text": "#26392B",
+        "muted": "#5E725F", "accent": "#4C8058", "kind": "eco",
     },
     "fashion": {
-        "name": "Fashion Editorial",
-        "emoji": "🖤",
+        "name": "Fashion Editorial", "emoji": "🖤",
         "description": "Строгая редакционная композиция",
-        "top": "#F1F0EE",
-        "bottom": "#D5D3D0",
-        "panel": "#FAF9F7",
-        "text": "#151515",
-        "muted": "#5A5856",
-        "accent": "#C53A48",
-        "kind": "fashion",
+        "top": "#F1F0EE", "bottom": "#D5D3D0",
+        "panel": "#FAF9F7", "text": "#151515",
+        "muted": "#5A5856", "accent": "#C53A48", "kind": "fashion",
     },
     "info": {
-        "name": "Инфографика PRO",
-        "emoji": "📊",
+        "name": "Инфографика PRO", "emoji": "📊",
         "description": "Светлые блоки и понятная иерархия",
-        "top": "#F1F6FC",
-        "bottom": "#DCE8F7",
-        "panel": "#FFFFFF",
-        "text": "#172A46",
-        "muted": "#526985",
-        "accent": "#2869C7",
-        "kind": "info",
+        "top": "#F1F6FC", "bottom": "#DCE8F7",
+        "panel": "#FFFFFF", "text": "#172A46",
+        "muted": "#526985", "accent": "#2869C7", "kind": "info",
     },
     "pop": {
-        "name": "Pop & Fun",
-        "emoji": "🎨",
+        "name": "Pop & Fun", "emoji": "🎨",
         "description": "Яркие фиолетовые и жёлтые акценты",
-        "top": "#F2E8FF",
-        "bottom": "#D8C2FF",
-        "panel": "#FFFDF7",
-        "text": "#29213C",
-        "muted": "#66577E",
-        "accent": "#7546D8",
-        "kind": "pop",
+        "top": "#F2E8FF", "bottom": "#D8C2FF",
+        "panel": "#FFFDF7", "text": "#29213C",
+        "muted": "#66577E", "accent": "#7546D8", "kind": "pop",
     },
     "cinematic": {
-        "name": "Cinematic",
-        "emoji": "🎬",
+        "name": "Cinematic", "emoji": "🎬",
         "description": "Тёмная кинематографичная студия",
-        "top": "#30343B",
-        "bottom": "#080A0D",
-        "panel": "#12151A",
-        "text": "#FFFFFF",
-        "muted": "#B5BBC4",
-        "accent": "#FFB86B",
-        "kind": "cinematic",
+        "top": "#30343B", "bottom": "#080A0D",
+        "panel": "#12151A", "text": "#FFFFFF",
+        "muted": "#B5BBC4", "accent": "#FFB86B", "kind": "cinematic",
     },
 }
 
@@ -201,10 +161,6 @@ CARD_ROLES = [
     "атмосферная презентация",
     "финальная презентация товара",
 ]
-
-# ============================================================
-# СОСТОЯНИЕ
-# ============================================================
 
 pending_photos = {}
 pending_jobs = {}
@@ -256,16 +212,12 @@ def note_runtime_error(error):
 
 def allow_message_rate(chat_id):
     now = time.monotonic()
-
     with rate_lock:
         bucket = message_times[chat_id]
-
         while bucket and now - bucket[0] > RATE_LIMIT_WINDOW:
             bucket.popleft()
-
         if len(bucket) >= RATE_LIMIT_MESSAGES:
             return False
-
         bucket.append(now)
         return True
 
@@ -274,7 +226,6 @@ def format_duration(seconds):
     seconds = max(0, int(seconds))
     hours, rem = divmod(seconds, 3600)
     minutes, secs = divmod(rem, 60)
-
     if hours:
         return f"{hours} ч {minutes} мин"
     if minutes:
@@ -285,21 +236,15 @@ def format_duration(seconds):
 def user_balance_text(balance):
     if balance["admin"]:
         return "👑 У тебя безлимит."
-
-    free_text = (
-        "уже использована"
-        if balance["free_used"]
-        else "доступна"
-    )
-
     return (
-        f"🎁 Бесплатный комплект: {free_text}.\n"
+        f"🎁 Бесплатный комплект: "
+        f"{'уже использован' if balance['free_used'] else 'доступен'}.\n"
         f"⭐ Купленных комплектов: {balance['credits']}."
     )
 
 
 # ============================================================
-# БАЗА ДАННЫХ
+# POSTGRESQL
 # ============================================================
 
 def db_connect():
@@ -316,7 +261,6 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS payments (
                 charge_id TEXT PRIMARY KEY,
@@ -326,7 +270,6 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS processing_events (
                 id BIGSERIAL PRIMARY KEY,
@@ -336,17 +279,14 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
-
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_processing_events_created
             ON processing_events(created_at)
         """)
-
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_processing_events_user
             ON processing_events(telegram_id, created_at)
         """)
-
     logger.info("PostgreSQL database is ready")
 
 
@@ -354,12 +294,10 @@ def record_event(chat_id, event_type, detail=""):
     try:
         with db_connect() as conn:
             conn.execute(
-                """
-                INSERT INTO processing_events
-                    (telegram_id, event_type, detail)
-                VALUES (%s, %s, %s)
-                """,
-                (int(chat_id), str(event_type)[:40], str(detail)[:300])
+                """INSERT INTO processing_events
+                   (telegram_id, event_type, detail)
+                   VALUES (%s, %s, %s)""",
+                (int(chat_id), str(event_type)[:40], str(detail)[:300]),
             )
     except Exception:
         logger.exception("Could not record processing event")
@@ -371,137 +309,82 @@ init_db()
 def ensure_user(chat_id):
     with db_connect() as conn:
         conn.execute(
-            """
-            INSERT INTO users (telegram_id)
-            VALUES (%s)
-            ON CONFLICT (telegram_id) DO NOTHING
-            """,
-            (chat_id,)
+            """INSERT INTO users (telegram_id) VALUES (%s)
+               ON CONFLICT (telegram_id) DO NOTHING""",
+            (int(chat_id),),
         )
 
 
 def get_balance(chat_id):
     ensure_user(chat_id)
-
     with db_connect() as conn:
         row = conn.execute(
-            """
-            SELECT free_used, credits
-            FROM users
-            WHERE telegram_id = %s
-            """,
-            (chat_id,)
+            "SELECT free_used, credits FROM users WHERE telegram_id = %s",
+            (int(chat_id),),
         ).fetchone()
-
-    return {
-        "free_used": row[0],
-        "credits": row[1],
-        "admin": is_admin(chat_id),
-    }
+    return {"free_used": row[0], "credits": row[1], "admin": is_admin(chat_id)}
 
 
 def reserve_credit(chat_id):
+    ensure_user(chat_id)
     if is_admin(chat_id):
-        ensure_user(chat_id)
         return "admin"
 
     with db_connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO users (telegram_id)
-            VALUES (%s)
-            ON CONFLICT (telegram_id) DO NOTHING
-            """,
-            (chat_id,)
-        )
-
         row = conn.execute(
-            """
-            SELECT free_used, credits
-            FROM users
-            WHERE telegram_id = %s
-            FOR UPDATE
-            """,
-            (chat_id,)
+            """SELECT free_used, credits FROM users
+               WHERE telegram_id = %s FOR UPDATE""",
+            (int(chat_id),),
         ).fetchone()
 
         free_used, credits = row
-
         if not free_used:
             conn.execute(
-                """
-                UPDATE users
-                SET free_used = TRUE
-                WHERE telegram_id = %s
-                """,
-                (chat_id,)
+                "UPDATE users SET free_used = TRUE WHERE telegram_id = %s",
+                (int(chat_id),),
             )
             return "free"
 
         if credits > 0:
             conn.execute(
-                """
-                UPDATE users
-                SET credits = credits - 1
-                WHERE telegram_id = %s
-                """,
-                (chat_id,)
+                "UPDATE users SET credits = credits - 1 WHERE telegram_id = %s",
+                (int(chat_id),),
             )
             return "paid"
 
-        return None
+    return None
 
 
 def refund_credit(chat_id, credit_type):
     if credit_type in (None, "admin"):
         return
-
     with db_connect() as conn:
         if credit_type == "free":
             conn.execute(
-                """
-                UPDATE users SET free_used = FALSE
-                WHERE telegram_id = %s
-                """,
-                (chat_id,)
+                "UPDATE users SET free_used = FALSE WHERE telegram_id = %s",
+                (int(chat_id),),
             )
-
         elif credit_type == "paid":
             conn.execute(
-                """
-                UPDATE users SET credits = credits + 1
-                WHERE telegram_id = %s
-                """,
-                (chat_id,)
+                "UPDATE users SET credits = credits + 1 WHERE telegram_id = %s",
+                (int(chat_id),),
             )
 
 
 def get_admin_stats():
     with db_connect() as conn:
         users = conn.execute(
-            """
-            SELECT COUNT(*), COALESCE(SUM(credits), 0)
-            FROM users
-            """
+            "SELECT COUNT(*), COALESCE(SUM(credits), 0) FROM users"
         ).fetchone()
-
         payments = conn.execute(
-            """
-            SELECT COUNT(*), COALESCE(SUM(stars), 0),
-                   COALESCE(SUM(credits), 0)
-            FROM payments
-            """
+            """SELECT COUNT(*), COALESCE(SUM(stars), 0),
+                      COALESCE(SUM(credits), 0) FROM payments"""
         ).fetchone()
-
         events = conn.execute(
-            """
-            SELECT event_type, COUNT(*)
-            FROM processing_events
-            WHERE created_at > NOW() - INTERVAL '7 days'
-            GROUP BY event_type
-            """
+            """SELECT event_type, COUNT(*) FROM processing_events
+               WHERE created_at > NOW() - INTERVAL '7 days'
+               GROUP BY event_type"""
         ).fetchall()
-
     return {
         "users": users[0],
         "credits_remaining": users[1],
@@ -518,34 +401,21 @@ def get_admin_stats():
 
 def telegram_api(method, data=None, timeout=35):
     response = http.post(
-        f"{API_URL}/{method}",
-        json=data or {},
-        timeout=timeout
+        f"{API_URL}/{method}", json=data or {}, timeout=timeout
     )
     response.raise_for_status()
-
     result = response.json()
-
     if not result.get("ok"):
-        raise RuntimeError(
-            result.get("description", "Telegram API error")
-        )
-
+        raise RuntimeError(result.get("description", "Telegram API error"))
     return result.get("result")
 
 
 def send_message(chat_id, text, reply_markup=None, parse_mode=None):
-    data = {
-        "chat_id": chat_id,
-        "text": str(text)[:4096],
-    }
-
+    data = {"chat_id": chat_id, "text": str(text)[:4096]}
     if reply_markup:
         data["reply_markup"] = reply_markup
-
     if parse_mode:
         data["parse_mode"] = parse_mode
-
     try:
         telegram_api("sendMessage", data)
     except Exception:
@@ -568,51 +438,31 @@ def main_keyboard():
 def photo_collection_keyboard():
     return {
         "inline_keyboard": [
-            [
-                {
-                    "text": "✅ Фотографии загружены",
-                    "callback_data": "photos:done",
-                }
-            ],
-            [
-                {
-                    "text": "ℹ️ Какой ракурс прислать?",
-                    "callback_data": "photos:help",
-                }
-            ],
+            [{"text": "✅ Фотографии загружены", "callback_data": "photos:done"}],
+            [{"text": "ℹ️ Какой ракурс прислать?", "callback_data": "photos:help"}],
         ]
     }
 
 
 def style_keyboard():
-    rows = []
     items = list(STYLE_OPTIONS.items())
-
+    rows = []
     for index in range(0, len(items), 2):
-        row = []
-
-        for style_id, style in items[index:index + 2]:
-            row.append({
+        rows.append([
+            {
                 "text": f"{style['emoji']} {style['name']}",
                 "callback_data": f"style:{style_id}",
-            })
-
-        rows.append(row)
-
+            }
+            for style_id, style in items[index:index + 2]
+        ])
     return {"inline_keyboard": rows}
 
 
 def count_keyboard():
     return {
         "inline_keyboard": [
-            [
-                {"text": str(n), "callback_data": f"count:{n}"}
-                for n in (1, 2, 3, 4)
-            ],
-            [
-                {"text": str(n), "callback_data": f"count:{n}"}
-                for n in (5, 6, 7)
-            ],
+            [{"text": str(n), "callback_data": f"count:{n}"} for n in (1, 2, 3, 4)],
+            [{"text": str(n), "callback_data": f"count:{n}"} for n in (5, 6, 7)],
         ]
     }
 
@@ -620,25 +470,19 @@ def count_keyboard():
 def answer_callback_query(callback_id, text=None):
     try:
         data = {"callback_query_id": callback_id}
-
         if text:
             data["text"] = text[:180]
-
         telegram_api("answerCallbackQuery", data)
-
     except Exception:
         logger.exception("Could not answer callback query")
 
 
 def reset_keyboard(chat_id):
-    telegram_api(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": "Обновляю меню...",
-            "reply_markup": {"remove_keyboard": True},
-        }
-    )
+    telegram_api("sendMessage", {
+        "chat_id": chat_id,
+        "text": "Обновляю меню...",
+        "reply_markup": {"remove_keyboard": True},
+    })
 
 
 # ============================================================
@@ -647,7 +491,6 @@ def reset_keyboard(chat_id):
 
 def send_invoice(chat_id):
     payload = f"tovarpix_pack5_{chat_id}_{uuid.uuid4().hex}"
-
     telegram_api("sendInvoice", {
         "chat_id": chat_id,
         "title": "TovarPix — 5 комплектов карточек",
@@ -658,38 +501,31 @@ def send_invoice(chat_id):
         "payload": payload,
         "provider_token": "",
         "currency": "XTR",
-        "prices": [
-            {"label": "5 комплектов", "amount": PACKAGE_STARS}
-        ],
+        "prices": [{"label": "5 комплектов", "amount": PACKAGE_STARS}],
     })
 
 
 def answer_pre_checkout(query_id, ok, error_message=None):
     data = {"pre_checkout_query_id": query_id, "ok": ok}
-
     if error_message:
         data["error_message"] = error_message
-
     telegram_api("answerPreCheckoutQuery", data)
 
 
 def handle_pre_checkout(query):
     try:
-        payload = query.get("invoice_payload", "")
         sender_id = query.get("from", {}).get("id")
-
+        payload = query.get("invoice_payload", "")
         valid = (
-            payload.startswith(f"tovarpix_pack5_{sender_id}_")
+            bool(sender_id)
+            and payload.startswith(f"tovarpix_pack5_{sender_id}_")
             and query.get("currency") == "XTR"
             and query.get("total_amount") == PACKAGE_STARS
         )
-
         answer_pre_checkout(
-            query["id"],
-            valid,
+            query["id"], valid,
             None if valid else "Не удалось проверить заказ. Попробуй снова.",
         )
-
     except Exception:
         logger.exception("Pre-checkout validation failed")
 
@@ -702,119 +538,116 @@ def handle_successful_payment(message):
     amount = payment.get("total_amount")
     currency = payment.get("currency")
 
-    expected_prefix = f"tovarpix_pack5_{chat_id}_"
-
     if (
-        not chat_id
-        or not charge_id
-        or not payload.startswith(expected_prefix)
+        not chat_id or not charge_id
+        or not payload.startswith(f"tovarpix_pack5_{chat_id}_")
         or currency != "XTR"
         or amount != PACKAGE_STARS
     ):
         logger.error("Payment validation failed")
-
         if chat_id:
-            send_message(
-                chat_id,
-                "Не удалось автоматически проверить платёж. "
-                "Обратись в поддержку."
-            )
-
+            send_message(chat_id, "Не удалось проверить платёж. Обратись в поддержку.")
         return
 
     try:
         with db_connect() as conn:
             inserted = conn.execute(
-                """
-                INSERT INTO payments (charge_id, telegram_id, credits, stars)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (charge_id) DO NOTHING
-                RETURNING charge_id
-                """,
-                (charge_id, chat_id, PACKAGE_IMAGES, amount)
+                """INSERT INTO payments (charge_id, telegram_id, credits, stars)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (charge_id) DO NOTHING
+                   RETURNING charge_id""",
+                (charge_id, int(chat_id), PACKAGE_IMAGES, amount),
             ).fetchone()
 
             if inserted:
                 conn.execute(
-                    """
-                    INSERT INTO users (telegram_id, credits)
-                    VALUES (%s, %s)
-                    ON CONFLICT (telegram_id)
-                    DO UPDATE SET
-                        credits = users.credits + EXCLUDED.credits
-                    """,
-                    (chat_id, PACKAGE_IMAGES)
+                    """INSERT INTO users (telegram_id, credits)
+                       VALUES (%s, %s)
+                       ON CONFLICT (telegram_id)
+                       DO UPDATE SET credits = users.credits + EXCLUDED.credits""",
+                    (int(chat_id), PACKAGE_IMAGES),
                 )
 
         if inserted:
-            record_event(
-                chat_id,
-                "payment",
-                f"{amount} Stars; {PACKAGE_IMAGES} credits"
-            )
-
+            record_event(chat_id, "payment", f"{amount} Stars; {PACKAGE_IMAGES} credits")
             send_message(
                 chat_id,
-                "✅ Оплата получена!\n\n"
-                f"Начислено комплектов: {PACKAGE_IMAGES}.\n"
+                f"✅ Оплата получена!\n\nНачислено комплектов: {PACKAGE_IMAGES}.\n"
                 "Отправь фотографию товара, чтобы начать.",
                 main_keyboard(),
             )
-
         else:
             send_message(chat_id, "Этот платёж уже был учтён.")
-
     except Exception:
         logger.exception("Could not credit successful payment")
-
         send_message(
             chat_id,
-            "Платёж получен Telegram, но не удалось начислить комплекты. "
-            "Не оплачивай повторно — обратись в поддержку."
+            "Платёж получен Telegram, но начислить комплекты не удалось. "
+            "Не оплачивай повторно — обратись в поддержку.",
         )
 
 
 # ============================================================
-# ЗАГРУЗКА И НОРМАЛИЗАЦИЯ ФОТО
+# ФОТОГРАФИИ
 # ============================================================
+
+def inspect_image(image_bytes):
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            width, height = image.size
+            if width < 64 or height < 64:
+                raise RuntimeError("Изображение слишком маленькое")
+            if width > MAX_IMAGE_SIDE * 4 or height > MAX_IMAGE_SIDE * 4:
+                raise RuntimeError("Размеры изображения слишком большие")
+            if width * height > MAX_IMAGE_PIXELS:
+                raise RuntimeError("Изображение слишком большое по количеству пикселей")
+            image.verify()
+            return {
+                "width": width,
+                "height": height,
+                "format": image.format or "unknown",
+                "pixels": width * height,
+            }
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("Не удалось прочитать изображение") from exc
+
 
 def download_telegram_photo(file_id):
     info = telegram_api("getFile", {"file_id": file_id})
     file_path = info.get("file_path")
-
     if not file_path:
         raise RuntimeError("Telegram не вернул путь к фотографии")
 
-    response = http.get(
-        f"https://api.telegram.org/file/bot{TOKEN}/{file_path}",
-        timeout=45
-    )
-    response.raise_for_status()
+    url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+    with http.get(url, timeout=45, stream=True) as response:
+        response.raise_for_status()
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_IMAGE_BYTES:
+                raise RuntimeError("Фото больше допустимого размера")
+            chunks.append(chunk)
+        image_bytes = b"".join(chunks)
 
-    if len(response.content) > MAX_IMAGE_BYTES:
-        raise RuntimeError("Фото больше допустимого размера")
-
-    inspect_image(response.content)
-    return response.content
+    inspect_image(image_bytes)
+    return image_bytes
 
 
-def normalize_image_bytes(
-    image_bytes,
-    max_side=MAX_IMAGE_SIDE,
-    quality=94
-):
+def normalize_image_bytes(image_bytes, max_side=MAX_IMAGE_SIDE, quality=94):
+    inspect_image(image_bytes)
     with Image.open(io.BytesIO(image_bytes)) as original:
         image = ImageOps.exif_transpose(original)
-
-        if image.width > max_side or image.height > max_side:
-            image.thumbnail(
-                (max_side, max_side),
-                Image.Resampling.LANCZOS
-            )
+        image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
 
         if image.mode in ("RGBA", "LA"):
-            background = Image.new("RGBA", image.size, "white")
-            background.alpha_composite(image.convert("RGBA"))
+            rgba = image.convert("RGBA")
+            background = Image.new("RGBA", rgba.size, "white")
+            background.alpha_composite(rgba)
             image = background.convert("RGB")
         else:
             image = image.convert("RGB")
@@ -824,61 +657,26 @@ def normalize_image_bytes(
         return output.getvalue()
 
 
-def inspect_image(image_bytes):
-    try:
-        with Image.open(io.BytesIO(image_bytes)) as image:
-            width, height = image.size
-
-            if width < 64 or height < 64:
-                raise RuntimeError("Изображение слишком маленькое")
-
-            if width > 30000 or height > 30000:
-                raise RuntimeError("Размеры изображения слишком большие")
-
-            return {
-                "width": width,
-                "height": height,
-                "format": image.format or "unknown",
-                "pixels": width * height,
-            }
-
-    except RuntimeError:
-        raise
-    except Exception as exc:
-        raise RuntimeError("Не удалось прочитать изображение") from exc
-
-
 # ============================================================
-# ОБРАБОТКА ТОВАРА
+# MAGIC HOUR: ГЕНЕРАЦИЯ ФОТО
 # ============================================================
 
 BASE_PROMPT = """
 You are a professional commercial product photographer.
 
-The provided images may show the SAME physical product from different
-angles. Treat them as references for one product, not separate products.
+All provided images may show the SAME physical product from different
+angles. Use them as references for one product, never as separate products.
 
-PRODUCT IDENTITY IS CRITICAL:
-Preserve the original product design, exact geometry, proportions,
-colors, materials, buttons, ports, labels, branding, logos, stickers,
-camera count, lens positions, accessories and other visible details.
+Preserve product identity: geometry, proportions, color, materials, buttons,
+ports, labels, branding, logos, stickers, camera count, lens positions,
+accessories and visible details. Do not redesign, duplicate, replace or
+invent physical parts. Do not combine views into a collage.
 
-Do not redesign, duplicate, replace or invent physical product parts.
-Do not invent details that are not visible in any reference image.
-Use additional reference photos to understand the same product from
-different angles. Do not combine different angles into a collage.
-
-BACKGROUND:
 Create a realistic commercial photo shoot with believable lighting,
-contact shadows and coherent reflections.
-
-COMPOSITION:
-The product must remain recognizable and fully visible where possible.
-Do not add promotional text, prices, discounts, specifications,
-watermarks or invented badges inside the generated photograph.
-
-Avoid floating objects, halos, fake reflections, distorted geometry,
-plastic-looking materials and excessive glow.
+contact shadows and coherent reflections. Keep the product recognizable.
+Do not add text, prices, discounts, specifications, watermarks or invented
+badges inside the generated photograph. Avoid floating objects, halos,
+fake reflections, distorted geometry and excessive glow.
 """
 
 
@@ -886,23 +684,14 @@ def generate_product_image(image_bytes_list, user_prompt):
     if not image_bytes_list:
         raise RuntimeError("Не передано ни одной фотографии")
 
-    normalized_images = [
-        normalize_image_bytes(data)
-        for data in image_bytes_list
-    ]
-
-    prompt = (
-        BASE_PROMPT
-        + "\nVISUAL STYLE:\n"
-        + clean_user_text(user_prompt)
-    )
+    normalized_images = [normalize_image_bytes(data) for data in image_bytes_list]
+    prompt = BASE_PROMPT + "\nVISUAL STYLE:\n" + clean_user_text(user_prompt)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         paths = []
-
-        for index, image_data in enumerate(normalized_images):
-            path = Path(temp_dir) / f"reference_{index + 1}.jpg"
-            path.write_bytes(image_data)
+        for index, data in enumerate(normalized_images, start=1):
+            path = Path(temp_dir) / f"reference_{index}.jpg"
+            path.write_bytes(data)
             paths.append(str(path))
 
         result = magic_client.v1.ai_image_editor.generate(
@@ -918,58 +707,48 @@ def generate_product_image(image_bytes_list, user_prompt):
             download_directory=temp_dir,
         )
 
-        if result.status != "complete":
+        if getattr(result, "status", None) != "complete":
             error = getattr(result, "error", None)
-
             if error:
                 raise RuntimeError(
-                    f"Magic Hour: {error.code}: {error.message}"
+                    f"Magic Hour: {getattr(error, 'code', 'error')}: "
+                    f"{getattr(error, 'message', str(error))}"
                 )
-
             raise RuntimeError(
-                f"Генерация завершилась со статусом: {result.status}"
+                f"Генерация завершилась со статусом: "
+                f"{getattr(result, 'status', 'unknown')}"
             )
 
-        paths = result.downloaded_paths
+        paths = getattr(result, "downloaded_paths", None)
+        if not paths:
+            raise RuntimeError("Magic Hour не вернул готовое изображение")
 
-        if not paths or not Path(str(paths[0])).is_file():
+        output_path = Path(str(paths[0]))
+        if not output_path.is_file():
             raise RuntimeError("Не найден готовый файл изображения")
 
-        output_bytes = Path(str(paths[0])).read_bytes()
-
-        return io.BytesIO(
-            normalize_image_bytes(
-                output_bytes,
-                max_side=3000,
-                quality=94
-            )
-        )
+        output_bytes = output_path.read_bytes()
+        return io.BytesIO(normalize_image_bytes(output_bytes, max_side=3000, quality=94))
 
 
 # ============================================================
-# ТЕКСТ: ТОЛЬКО ПОДТВЕРЖДЁННЫЕ СВЕДЕНИЯ
+# GEMINI: ТЕКСТ ДЛЯ КАРТОЧКИ
 # ============================================================
 
 def get_ad_copy(image_bytes, user_prompt):
     if not GEMINI_API_KEY:
         return None
 
-    normalized = normalize_image_bytes(
-        image_bytes,
-        max_side=1000,
-        quality=80
-    )
-
+    normalized = normalize_image_bytes(image_bytes, max_side=700, quality=80)
     with Image.open(io.BytesIO(normalized)) as image:
         image.thumbnail((512, 512))
-
-        image_buffer = io.BytesIO()
-        image.save(image_buffer, format="JPEG", quality=78)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=78)
 
     instruction = f"""
 Ты — редактор текста для карточек товаров.
 
-Пожелания и сведения пользователя:
+Пожелания и факты пользователя:
 {clean_user_text(user_prompt)}
 
 Верни только JSON с полями:
@@ -981,26 +760,21 @@ def get_ad_copy(image_bytes, user_prompt):
   "features": []
 }}
 
-Строгие правила:
-1. Не выдумывай характеристики, материал, модель, цену, скидку,
-   гарантию, комплектацию, происхождение или преимущества товара.
-2. Используй только сведения, которые прямо указал пользователь.
-3. Не считай внешний вид доказательством технических характеристик.
-4. Если пользователь не сообщил характеристики, оставь features пустым.
-5. Не придумывай рекламные обещания.
-6. Заголовок должен быть нейтральным, если фактов недостаточно.
-7. title: максимум 34 символа.
-8. subtitle: максимум 55 символов.
-9. badge: максимум 18 символов.
-10. features: не более 3 пунктов, до 32 символов каждый.
-11. Пиши по-русски.
-12. make_ad_card=false, если пользователь не просил рекламную карточку
-    или размещение текста.
-
-Не добавляй Markdown и пояснения за пределами JSON.
+Правила:
+- Не выдумывай характеристики, материалы, модель, цену, скидку,
+  гарантию, комплектацию, происхождение или преимущества.
+- Используй только сведения, которые прямо сообщил пользователь.
+- Внешний вид не доказывает технические характеристики.
+- Если характеристики не сообщены, features должен быть пустым.
+- Заголовок нейтральный, если фактов мало.
+- title до 34 символов; subtitle до 55; badge до 18.
+- features: максимум 3 пункта, каждый до 32 символов.
+- Пиши по-русски.
+- make_ad_card=false, если пользователь явно не просил текст на карточке.
+- Никакого Markdown или пояснений за пределами JSON.
 """
 
-    response = requests.post(
+    response = http.post(
         "https://generativelanguage.googleapis.com/v1beta/"
         f"models/{GEMINI_MODEL}:generateContent",
         params={"key": GEMINI_API_KEY},
@@ -1008,14 +782,10 @@ def get_ad_copy(image_bytes, user_prompt):
             "contents": [{
                 "parts": [
                     {"text": instruction},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": base64.b64encode(
-                                image_buffer.getvalue()
-                            ).decode("ascii"),
-                        }
-                    },
+                    {"inline_data": {
+                        "mime_type": "image/jpeg",
+                        "data": base64.b64encode(buffer.getvalue()).decode("ascii"),
+                    }},
                 ]
             }],
             "generationConfig": {
@@ -1026,52 +796,29 @@ def get_ad_copy(image_bytes, user_prompt):
         },
         timeout=35,
     )
-
     response.raise_for_status()
     body = response.json()
-
     candidates = body.get("candidates", [])
-
     if not candidates:
         raise RuntimeError("Gemini не вернул текст")
 
     parts = candidates[0].get("content", {}).get("parts", [])
-    answer = next(
-        (part.get("text", "") for part in parts if part.get("text")),
-        ""
-    ).strip()
-
+    answer = next((p.get("text", "") for p in parts if p.get("text")), "").strip()
     if not answer:
         raise RuntimeError("Gemini вернул пустой ответ")
 
     if answer.startswith("```"):
         answer = answer.split("\n", 1)[-1]
-
         if answer.endswith("```"):
             answer = answer[:-3].strip()
 
     data = json.loads(answer)
-
     if not data.get("make_ad_card"):
         return None
 
-    allowed_accents = {
-        "#D9FF43",
-        "#FFFFFF",
-        "#65D6FF",
-        "#FFB86B",
-        "#FF7A90",
-    }
-
-    accent = str(data.get("accent", "#D9FF43")).upper()
-
-    if accent not in allowed_accents:
-        accent = "#D9FF43"
-
-    raw_features = data.get("features", [])
-
-    if not isinstance(raw_features, list):
-        raw_features = []
+    features = data.get("features", [])
+    if not isinstance(features, list):
+        features = []
 
     return {
         "title": clean_user_text(data.get("title", ""), 34),
@@ -1079,37 +826,34 @@ def get_ad_copy(image_bytes, user_prompt):
         "badge": clean_user_text(data.get("badge", ""), 18),
         "features": [
             clean_user_text(item, 32)
-            for item in raw_features
+            for item in features
             if isinstance(item, str) and clean_user_text(item, 32)
         ][:3],
-        "accent": accent,
     }
 
 
 # ============================================================
-# ШАБЛОНЫ: ТЕКСТ РИСУЕТ PYTHON, НЕ НЕЙРОСЕТЬ
+# РИСОВАНИЕ ШАБЛОНОВ
 # ============================================================
 
 def load_font(size, bold=False):
-    if bold:
-        paths = [
+    names = (
+        [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
             "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
         ]
-    else:
-        paths = [
+        if bold else [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
             "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
         ]
-
-    for path in paths:
+    )
+    for path in names:
         try:
             return ImageFont.truetype(path, size)
         except OSError:
-            continue
-
+            pass
     return ImageFont.load_default()
 
 
@@ -1120,69 +864,54 @@ def text_width(draw, text, font):
 
 def fit_text(draw, text, font, max_width):
     text = str(text or "").strip()
-
     if text_width(draw, text, font) <= max_width:
         return text
-
     while text:
         candidate = text.rstrip() + "…"
-
         if text_width(draw, candidate, font) <= max_width:
             return candidate
-
         text = text[:-1]
-
     return ""
 
 
 def wrap_text(draw, text, font, max_width, max_lines=2):
     words = str(text or "").split()
+    if not words:
+        return []
+
     lines = []
     current = ""
 
     for word in words:
-        candidate = word if not current else current + " " + word
+        # Длинные слова отдельно сокращаем, чтобы не выходить за границы.
+        if text_width(draw, word, font) > max_width:
+            word = fit_text(draw, word, font, max_width)
 
+        candidate = word if not current else current + " " + word
         if text_width(draw, candidate, font) <= max_width:
             current = candidate
         else:
             if current:
                 lines.append(current)
-
             current = word
-
             if len(lines) >= max_lines:
                 break
 
     if current and len(lines) < max_lines:
         lines.append(current)
 
-    if len(lines) == max_lines and words:
-        original = str(text).strip()
-        joined = " ".join(lines)
-
-        if len(joined) < len(original):
-            lines[-1] = fit_text(
-                draw,
-                lines[-1],
-                font,
-                max_width
-            )
-
-    return lines
+    consumed = " ".join(lines)
+    if len(lines) == max_lines and len(consumed) < len(" ".join(words)):
+        lines[-1] = fit_text(draw, lines[-1], font, max_width)
+    return lines[:max_lines]
 
 
 def hex_to_rgb(value, fallback=(217, 255, 67)):
     try:
         value = str(value).lstrip("#")
-
         if len(value) != 6:
             return fallback
-
-        return tuple(
-            int(value[index:index + 2], 16)
-            for index in (0, 2, 4)
-        )
+        return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
     except Exception:
         return fallback
 
@@ -1190,509 +919,238 @@ def hex_to_rgb(value, fallback=(217, 255, 67)):
 def draw_gradient(canvas, box, top_color, bottom_color):
     x0, y0, x1, y1 = box
     height = max(1, y1 - y0)
-
     top = hex_to_rgb(top_color, (24, 26, 32))
     bottom = hex_to_rgb(bottom_color, (13, 15, 20))
-
     draw = ImageDraw.Draw(canvas)
 
     for offset in range(height):
         ratio = offset / max(1, height - 1)
-
         color = tuple(
-            int(
-                top[channel] * (1 - ratio)
-                + bottom[channel] * ratio
-            )
-            for channel in range(3)
+            int(top[c] * (1 - ratio) + bottom[c] * ratio)
+            for c in range(3)
         )
-
-        draw.line(
-            (x0, y0 + offset, x1, y0 + offset),
-            fill=color
-        )
+        draw.line((x0, y0 + offset, x1, y0 + offset), fill=color)
 
 
-def render_ad_card(
-    image_bytes,
-    ad,
-    style_id="minimal",
-    card_index=1,
-    total_cards=1
-):
-    style = STYLE_OPTIONS.get(
-        style_id,
-        STYLE_OPTIONS["minimal"]
-    )
-
-    normalized = normalize_image_bytes(
-        image_bytes,
-        max_side=1200,
-        quality=93
-    )
-
-    with Image.open(io.BytesIO(normalized)) as source:
+def render_ad_card(image_bytes, ad, style_id="minimal", card_index=1, total_cards=1):
+    style = STYLE_OPTIONS.get(style_id, STYLE_OPTIONS["minimal"])
+    with Image.open(io.BytesIO(normalize_image_bytes(image_bytes, 1200, 93))) as source:
         product_image = source.convert("RGB").copy()
 
-    # Фиксированный размер холста для всех карточек.
-    width = 1080
-    height = 1350
+    width, height = 1080, 1350
     margin = 64
-
-    # Фиксированные области шаблона.
-    image_top = 0
-    image_bottom = 790
-    footer_top = 790
-    footer_bottom = height
-
+    image_bottom = 760
+    footer_top = image_bottom
+    panel_height = height - footer_top
     content_width = width - margin * 2
 
-    canvas = Image.new(
-        "RGB",
-        (width, height),
-        style["panel"]
-    )
-
-    draw_gradient(
-        canvas,
-        (0, image_top, width, image_bottom),
-        style["top"],
-        style["bottom"]
-    )
-
+    canvas = Image.new("RGB", (width, height), style["panel"])
+    draw_gradient(canvas, (0, 0, width, image_bottom), style["top"], style["bottom"])
     draw = ImageDraw.Draw(canvas)
     kind = style["kind"]
 
-    # Декоративные элементы закреплены в координатах.
-    if kind == "luxury":
+    if kind in ("luxury", "cinematic"):
         draw.rectangle(
             (24, 24, width - 25, image_bottom - 24),
-            outline=style["accent"],
-            width=2
+            outline=style["accent"] if kind == "luxury" else "#555A63",
+            width=2,
         )
-
     elif kind == "tech":
         for gx in range(35, width, 90):
-            draw.line(
-                (gx, 0, gx, image_bottom),
-                fill="#294255",
-                width=1
-            )
-
+            draw.line((gx, 0, gx, image_bottom), fill="#294255", width=1)
         for gy in range(35, image_bottom, 90):
-            draw.line(
-                (0, gy, width, gy),
-                fill="#20384A",
-                width=1
-            )
-
+            draw.line((0, gy, width, gy), fill="#20384A", width=1)
     elif kind == "eco":
-        draw.ellipse(
-            (width - 250, 35, width - 45, 240),
-            outline="#A4B999",
-            width=3
-        )
-
+        draw.ellipse((width - 250, 35, width - 45, 240), outline="#A4B999", width=3)
     elif kind == "pop":
-        draw.ellipse(
-            (28, 35, 130, 137),
-            fill="#E8C84D"
-        )
-        draw.ellipse(
-            (width - 150, 45, width - 55, 140),
-            fill="#A48AF0"
-        )
-
+        draw.ellipse((28, 35, 130, 137), fill="#E8C84D")
+        draw.ellipse((width - 150, 45, width - 55, 140), fill="#A48AF0")
     elif kind == "fashion":
-        draw.line(
-            (margin, 48, width - margin, 48),
-            fill=style["text"],
-            width=2
-        )
-
-    elif kind == "cinematic":
-        draw.rectangle(
-            (18, 18, width - 19, image_bottom - 19),
-            outline="#555A63",
-            width=2
-        )
-
+        draw.line((margin, 48, width - margin, 48), fill=style["text"], width=2)
     elif kind == "market":
-        draw.polygon(
-            [(0, 0), (260, 0), (0, 180)],
-            fill="#FFE2A5"
-        )
-
+        draw.polygon([(0, 0), (260, 0), (0, 180)], fill="#FFE2A5")
     elif kind == "info":
         draw.rounded_rectangle(
             (28, 28, width - 28, image_bottom - 28),
-            radius=28,
-            outline="#B8CBE3",
-            width=3
+            radius=28, outline="#B8CBE3", width=3,
         )
 
-    # Область товара фиксирована. Товар вписывается без обрезки.
-    image_box_width = width - margin * 2
-    image_box_height = image_bottom - 100
-
-    product_image.thumbnail(
-        (image_box_width, image_box_height),
-        Image.Resampling.LANCZOS
-    )
-
+    # Изображение товара вписывается целиком в отведённую область.
+    image_box = (width - margin * 2, image_bottom - 100)
+    product_image.thumbnail(image_box, Image.Resampling.LANCZOS)
     px = (width - product_image.width) // 2
     py = (image_bottom - product_image.height) // 2
-
     canvas.paste(product_image, (px, py))
 
-    draw = ImageDraw.Draw(canvas)
-
-    if kind in (
-        "minimal", "cozy", "market",
-        "fashion", "info", "eco", "pop"
-    ):
-        draw.rectangle(
-            (0, footer_top, width, footer_bottom),
-            fill=style["panel"]
-        )
+    if kind in ("minimal", "cozy", "market", "fashion", "info", "eco", "pop"):
+        draw = ImageDraw.Draw(canvas)
+        draw.rectangle((0, footer_top, width, height), fill=style["panel"])
     else:
-        draw_gradient(
-            canvas,
-            (0, footer_top, width, footer_bottom),
-            style["panel"],
-            style["bottom"]
-        )
+        draw_gradient(canvas, (0, footer_top, width, height), style["panel"], style["bottom"])
 
     draw = ImageDraw.Draw(canvas)
-
     draw.line(
         (margin, footer_top, width - margin, footer_top),
-        fill=style["accent"],
-        width=3 if kind in ("luxury", "tech", "cinematic") else 2
+        fill=style["accent"], width=3 if kind in ("luxury", "tech", "cinematic") else 2,
     )
 
-    # Фиксированная зона текста: никакой случайной перестановки блоков.
+    # Надпись стиля и номер карточки.
     x = margin
-    y = footer_top + 28
-
-    overline_font = load_font(17, bold=True)
-    overline = (
-        f"TOVARPIX / {style['name'].upper()} / "
-        f"{card_index} ИЗ {total_cards}"
-    )
-
     draw.text(
-        (x, y),
-        overline[:75],
-        font=overline_font,
-        fill=style["accent"]
+        (x, footer_top + 20),
+        f"TOVARPIX / {style['name'].upper()} / {card_index} ИЗ {total_cards}"[:75],
+        font=load_font(16, True),
+        fill=style["accent"],
     )
 
-    y = footer_top + 68
-
+    # Компактный бейдж.
     badge = clean_user_text(ad.get("badge", ""), 18)
-
     if badge:
-        badge_font = load_font(20, bold=True)
-        badge_text = fit_text(
-            draw,
-            badge,
-            badge_font,
-            content_width - 40
-        )
-
-        badge_width = min(
-            content_width,
-            text_width(draw, badge_text, badge_font) + 36
-        )
-
-        badge_height = 42
-
+        badge_font = load_font(18, True)
+        badge_text = fit_text(draw, badge, badge_font, content_width - 32)
+        bw = min(content_width, text_width(draw, badge_text, badge_font) + 32)
+        by = footer_top + 48
         if kind in ("minimal", "eco", "fashion", "info"):
             draw.rounded_rectangle(
-                (x, y, x + badge_width, y + badge_height),
-                radius=12,
-                outline=style["accent"],
-                width=2
+                (x, by, x + bw, by + 36), radius=10,
+                outline=style["accent"], width=2,
             )
             badge_fill = style["text"]
         else:
             draw.rounded_rectangle(
-                (x, y, x + badge_width, y + badge_height),
-                radius=12,
-                fill=style["accent"]
+                (x, by, x + bw, by + 36), radius=10, fill=style["accent"]
             )
+            badge_fill = "#FFFFFF" if kind in ("tech", "cinematic", "luxury") else "#171717"
+        draw.text((x + 16, by + 7), badge_text, font=badge_font, fill=badge_fill)
 
-            badge_fill = (
-                "#FFFFFF"
-                if kind in ("tech", "cinematic", "luxury")
-                else "#171717"
-            )
+    # Зоны текста рассчитаны так, чтобы блоки не накладывались.
+    title = clean_user_text(ad.get("title", ""), 34) or "Товар в деталях"
+    title_font = load_font(34, True)
+    title_y = footer_top + 94
+    title_lines = wrap_text(draw, title, title_font, content_width, 2)
 
-        draw.text(
-            (x + 18, y + 8),
-            badge_text,
-            font=badge_font,
-            fill=badge_fill
-        )
+    for line in title_lines[:2]:
+        draw.text((x, title_y), line, font=title_font, fill=style["text"])
+        title_y += 41
 
-    # Заголовок всегда рисуется в одной области.
-    title = (
-        clean_user_text(ad.get("title", ""), 34)
-        or "Товар в деталях"
-    )
+    subtitle = clean_user_text(ad.get("subtitle", ""), 55)
+    subtitle_font = load_font(19)
+    subtitle_y = footer_top + 184
 
-    title_font = load_font(39, bold=True)
-    title_y = footer_top + 125
+    for line in wrap_text(draw, subtitle, subtitle_font, content_width, 2):
+        draw.text((x, subtitle_y), line, font=subtitle_font, fill=style["muted"])
+        subtitle_y += 25
 
-    title_lines = wrap_text(
-        draw,
-        title,
-        title_font,
-        content_width,
-        max_lines=2
-    )
-
-    for line in title_lines:
-        draw.text(
-            (x, title_y),
-            line,
-            font=title_font,
-            fill=style["text"]
-        )
-        title_y += 48
-
-    # Подзаголовок закреплён ниже заголовка.
-    subtitle = clean_user_text(
-        ad.get("subtitle", ""),
-        55
-    )
-
-    subtitle_font = load_font(22)
-    subtitle_y = footer_top + 225
-
-    for line in wrap_text(
-        draw,
-        subtitle,
-        subtitle_font,
-        content_width,
-        max_lines=2
-    ):
-        draw.text(
-            (x, subtitle_y),
-            line,
-            font=subtitle_font,
-            fill=style["muted"]
-        )
-        subtitle_y += 30
-
-    # Характеристики помещаются в зарезервированные строки.
-    # Если строка не помещается, она сокращается.
+    # Три строки характеристик: не заходят в нижнюю фирменную подпись.
     features = ad.get("features", [])[:3]
-    feature_font = load_font(18)
-
-    feature_start_y = footer_top + 295
-    feature_height = 39
+    feature_font = load_font(16)
+    feature_start_y = footer_top + 245
+    feature_height = 32
+    available_bottom = height - 37
 
     for index, feature in enumerate(features):
-        fy = feature_start_y + index * 46
-
-        if fy + feature_height > height - 44:
+        fy = feature_start_y + index * 38
+        if fy + feature_height > available_bottom:
             break
 
         label = fit_text(
-            draw,
-            clean_user_text(feature, 32),
-            feature_font,
-            content_width - 58
+            draw, clean_user_text(feature, 32), feature_font, content_width - 48
         )
 
         if kind in ("info", "market"):
-            fill_color = (
-                "#E8F0FA"
-                if kind == "info"
-                else "#FFF0D9"
-            )
-
+            fill = "#E8F0FA" if kind == "info" else "#FFF0D9"
             draw.rounded_rectangle(
                 (x, fy, x + content_width, fy + feature_height),
-                radius=9,
-                fill=fill_color
+                radius=8, fill=fill,
             )
         else:
             draw.rounded_rectangle(
                 (x, fy, x + content_width, fy + feature_height),
-                radius=9,
-                outline=style["accent"],
-                width=2
+                radius=8, outline=style["accent"], width=1,
             )
 
-        draw.ellipse(
-            (x + 13, fy + 13, x + 25, fy + 25),
-            fill=hex_to_rgb(style["accent"])
-        )
+        draw.ellipse((x + 11, fy + 10, x + 21, fy + 20), fill=style["accent"])
+        draw.text((x + 31, fy + 6), label, font=feature_font, fill=style["text"])
 
-        draw.text(
-            (x + 36, fy + 8),
-            label,
-            font=feature_font,
-            fill=style["text"]
-        )
-
-    # Фирменная подпись всегда в правом нижнем углу.
     brand = "TOVARPIX"
-    brand_font = load_font(15, bold=True)
+    brand_font = load_font(13, True)
     brand_width = text_width(draw, brand, brand_font)
-
     draw.text(
-        (width - margin - brand_width, height - 28),
-        brand,
-        font=brand_font,
-        fill=style["muted"]
+        (width - margin - brand_width, height - 25),
+        brand, font=brand_font, fill=style["muted"],
     )
 
     output = io.BytesIO()
-
-    canvas.save(
-        output,
-        format="JPEG",
-        quality=93,
-        optimize=True,
-        progressive=True
-    )
-
+    canvas.save(output, format="JPEG", quality=93, optimize=True, progressive=True)
     output.seek(0)
     return output
 
 
 def add_ad_layout_if_requested(
-    image_bytes,
-    user_prompt,
-    style_id="minimal",
-    card_index=1,
-    total_cards=1
+    image_bytes, user_prompt, style_id="minimal", card_index=1, total_cards=1
 ):
-    style = STYLE_OPTIONS.get(
-        style_id,
-        STYLE_OPTIONS["minimal"]
-    )
-
-    role = CARD_ROLES[
-        min(card_index - 1, len(CARD_ROLES) - 1)
-    ]
-
+    style = STYLE_OPTIONS.get(style_id, STYLE_OPTIONS["minimal"])
+    role = CARD_ROLES[min(card_index - 1, len(CARD_ROLES) - 1)]
     ad = None
 
     try:
         ad = get_ad_copy(
             image_bytes,
-            (
-                clean_user_text(user_prompt)
-                + f"\nРоль карточки: {role}."
-            )
+            clean_user_text(user_prompt) + f"\nРоль карточки: {role}.",
         )
-
     except Exception as exc:
         logger.exception("Could not generate ad copy")
         note_runtime_error(exc)
 
+    # Если Gemini недоступен или пользователь не просил рекламный текст,
+    # всё равно создаём аккуратную карточку с нейтральным заголовком.
     if not ad:
         ad = {
-            "title": (
-                "Товар в деталях"
-                if card_index != 1
-                else "Главный акцент"
-            ),
-            "subtitle": "Лаконичная презентация товара",
-            "badge": style["name"][:18],
+            "title": "Товар в деталях" if card_index > 1 else "Главный акцент",
+            "subtitle": "",
+            "badge": "",
             "features": [],
-            "accent": style["accent"],
         }
 
-    # Цвет берём из выбранного стиля, а не из ответа модели.
-    ad["accent"] = style["accent"]
-
     result = render_ad_card(
-        image_bytes,
-        ad,
-        style_id,
-        card_index,
-        total_cards
+        image_bytes, ad, style_id, card_index, total_cards
     )
-
     with state_lock:
         runtime_stats["cards_rendered"] += 1
-
     return result
 
 
 # ============================================================
-# ОТПРАВКА РЕЗУЛЬТАТА
+# ОТПРАВКА РЕЗУЛЬТАТОВ
 # ============================================================
 
-def send_generated_photo(
-    chat_id,
-    image_buffer,
-    caption=None,
-    filename="tovarpix_result.jpg"
-):
+def send_generated_photo(chat_id, image_buffer, caption=None, filename="tovarpix_result.jpg"):
     image_buffer.seek(0)
-
     response = http.post(
         f"{API_URL}/sendPhoto",
         data={
             "chat_id": str(chat_id),
-            "caption": (
-                caption
-                or "✅ Готово! Вот твоя обработанная карточка."
-            ),
+            "caption": caption or "✅ Готово! Вот твоя обработанная карточка.",
         },
-        files={
-            "photo": (
-                filename,
-                image_buffer,
-                "image/jpeg"
-            )
-        },
+        files={"photo": (filename, image_buffer, "image/jpeg")},
         timeout=60,
     )
-
     response.raise_for_status()
     body = response.json()
-
     if not body.get("ok"):
-        raise RuntimeError(
-            body.get(
-                "description",
-                "Telegram не смог отправить результат"
-            )
-        )
+        raise RuntimeError(body.get("description", "Telegram не смог отправить результат"))
 
 
 # ============================================================
-# ОБРАБОТКА КОМПЛЕКТА
+# ОБРАБОТКА КОМПЛЕКТА: 1 КРЕДИТ ЗА ВЕСЬ КОМПЛЕКТ
 # ============================================================
 
-def process_photo(
-    chat_id,
-    file_ids,
-    prompt,
-    style_id="minimal",
-    card_count=1
-):
+def process_photo(chat_id, file_ids, prompt, style_id="minimal", card_count=1):
     credit_type = None
     started = time.monotonic()
-
-    style = STYLE_OPTIONS.get(
-        style_id,
-        STYLE_OPTIONS["minimal"]
-    )
-
-    card_count = max(
-        1,
-        min(7, safe_int(card_count, 1))
-    )
-
+    sent_count = 0
+    style = STYLE_OPTIONS.get(style_id, STYLE_OPTIONS["minimal"])
+    card_count = max(1, min(7, safe_int(card_count, 1)))
     file_ids = list(file_ids)[:MAX_REFERENCE_PHOTOS]
 
     with state_lock:
@@ -1700,182 +1158,133 @@ def process_photo(
 
     try:
         credit_type = reserve_credit(chat_id)
-
         if credit_type is None:
             send_message(
                 chat_id,
-                "🎁 Бесплатный комплект уже использован, "
-                "а купленные комплекты закончились.\n\n"
+                "🎁 Бесплатный комплект уже использован, а купленные комплекты закончились.\n\n"
                 "Один комплект из 1–7 карточек стоит 1 кредит.\n"
                 "Купи 5 комплектов за 5 ⭐.",
-                main_keyboard()
+                main_keyboard(),
             )
             return
 
         prompt = clean_user_text(prompt) or (
-            "Создай качественные карточки товара. "
-            "Сохрани внешний вид товара."
+            "Создай качественные карточки товара. Сохрани внешний вид товара."
         )
 
         record_event(
-            chat_id,
-            "processing_started",
-            (
-                f"style={style_id};count={card_count};"
-                f"photos={len(file_ids)};{prompt[:100]}"
-            )
+            chat_id, "processing_started",
+            f"style={style_id};count={card_count};photos={len(file_ids)}",
         )
-
         send_message(
             chat_id,
             f"🎨 Начинаю комплект: {card_count} карточек.\n"
             f"Стиль: {style['emoji']} {style['name']}\n"
             f"Фотографий-референсов: {len(file_ids)}\n\n"
-            "За весь комплект списывается 1 кредит. "
-            "Подготовка может занять несколько минут."
+            "За весь комплект списывается 1 кредит. Подготовка может занять несколько минут.",
         )
 
-        # Загружаем все фотографии, а не только первое фото.
         image_bytes_list = []
-
         for index, file_id in enumerate(file_ids, start=1):
-            image_bytes = download_telegram_photo(file_id)
-            image_info = inspect_image(image_bytes)
-
+            data = download_telegram_photo(file_id)
+            info = inspect_image(data)
             logger.info(
-                "Reference accepted: chat=%s photo=%s "
-                "size=%sx%s format=%s",
-                chat_id,
-                index,
-                image_info["width"],
-                image_info["height"],
-                image_info["format"],
+                "Reference accepted: chat=%s photo=%s size=%sx%s format=%s",
+                chat_id, index, info["width"], info["height"], info["format"],
             )
-
-            image_bytes_list.append(image_bytes)
+            image_bytes_list.append(data)
 
         prepared = []
-
         for index in range(1, card_count + 1):
-            role = CARD_ROLES[
-                min(index - 1, len(CARD_ROLES) - 1)
-            ]
-
+            role = CARD_ROLES[min(index - 1, len(CARD_ROLES) - 1)]
             style_prompt = (
-                f"Создай карточку {index} из {card_count} "
-                f"для стиля «{style['name']}». "
-                f"Направление: {style['description']}. "
-                f"Роль карточки: {role}. "
-                "Все предоставленные фотографии показывают "
-                "один и тот же товар с разных ракурсов. "
-                "Используй их для сохранения точной конструкции. "
-                "Не меняй форму, пропорции, цвет, материалы, "
-                "логотипы, маркировки, кнопки и мелкие детали. "
-                "Не добавляй текст, цены, скидки или "
-                "несуществующие характеристики внутрь фотографии. "
-                "Меняй только фон, окружение, освещение и композицию. "
-                "Дополнительные пожелания пользователя: "
-                + prompt
+                f"Создай карточку {index} из {card_count} для стиля «{style['name']}». "
+                f"Направление: {style['description']}. Роль: {role}. "
+                "Все фотографии показывают один товар с разных ракурсов. "
+                "Сохрани точную конструкцию, форму, пропорции, цвет, материалы, "
+                "логотипы, маркировки, кнопки и детали. "
+                "Не добавляй текст, цены, скидки или выдуманные характеристики "
+                "внутрь самой фотографии. Меняй только фон, окружение, свет "
+                "и композицию. Пожелания пользователя: " + prompt
             )
 
-            generated = generate_product_image(
-                image_bytes_list,
-                style_prompt
-            )
-
-            # Берём первый ракурс для подготовки текстовой карточки.
-            # Сам шаблон не использует нейросеть для рисования текста.
+            generated = generate_product_image(image_bytes_list, style_prompt)
             card = add_ad_layout_if_requested(
                 generated.getvalue(),
-                (
-                    prompt
-                    + f". Роль карточки: {role}."
-                ),
-                style_id=style_id,
-                card_index=index,
-                total_cards=card_count,
+                prompt + f". Роль карточки: {role}.",
+                style_id, index, card_count,
             )
-
             prepared.append(card)
+            send_message(chat_id, f"Подготовлена карточка {index}/{card_count}…")
 
-            send_message(
-                chat_id,
-                f"Подготовлена карточка {index}/{card_count}…"
-            )
-
+        # Отправляем только после подготовки всего набора.
         for index, card in enumerate(prepared, start=1):
             send_generated_photo(
                 chat_id,
                 card,
-                caption=(
-                    f"✅ Карточка {index}/{card_count} "
-                    f"• {style['name']}"
-                ),
+                caption=f"✅ Карточка {index}/{card_count} • {style['name']}",
                 filename=f"tovarpix_{style_id}_{index}.jpg",
             )
+            sent_count += 1
 
         with state_lock:
             runtime_stats["images_succeeded"] += 1
             runtime_stats["last_success_at"] = utc_now_iso()
 
         record_event(
-            chat_id,
-            "processing_succeeded",
-            (
-                f"style={style_id};count={card_count};"
-                f"photos={len(file_ids)};"
-                f"duration={int(time.monotonic() - started)}s"
-            )
+            chat_id, "processing_succeeded",
+            f"style={style_id};count={card_count};duration={int(time.monotonic()-started)}s",
         )
 
         balance = get_balance(chat_id)
-
         balance_text = (
             "👑 У тебя безлимит."
             if balance["admin"]
-            else (
-                "⭐ Доступно комплектов карточек: "
-                f"{balance['credits']}."
-            )
+            else f"⭐ Осталось комплектов: {balance['credits']}."
         )
-
         send_message(
             chat_id,
-            f"🎉 Комплект готов: {card_count} карточек.\n"
-            + balance_text
-            + "\n\nМожешь отправить следующее фото.",
-            main_keyboard()
+            f"🎉 Комплект готов: {card_count} карточек.\n{balance_text}\n\n"
+            "Можешь отправить следующий товар.",
+            main_keyboard(),
         )
 
     except Exception as exc:
         logger.exception("Image set processing failed")
         note_runtime_error(exc)
-
         with state_lock:
             runtime_stats["images_failed"] += 1
 
         record_event(
-            chat_id,
-            "processing_failed",
-            f"style={style_id};count={card_count};{type(exc).__name__}"
+            chat_id, "processing_failed",
+            f"style={style_id};count={card_count};{type(exc).__name__}",
         )
 
-        if credit_type:
+        # Возвращаем кредит только если ни одна карточка не была доставлена.
+        # Иначе пользователь уже получил часть оплаченного комплекта.
+        if credit_type and sent_count == 0:
             try:
                 refund_credit(chat_id, credit_type)
             except Exception:
                 logger.exception("Credit refund failed")
 
-        error_text = str(exc).lower()
-
-        if "больше" in error_text or "маленькое" in error_text:
+        if sent_count:
+            message = (
+                f"⚠️ Не удалось отправить весь комплект: доставлено {sent_count} "
+                f"из {card_count} карточек. Кредит не возвращён, потому что часть "
+                "результатов уже отправлена. Сообщи администратору, если нужна помощь."
+            )
+        elif isinstance(exc, RuntimeError) and (
+            "размер" in str(exc).lower()
+            or "маленькое" in str(exc).lower()
+            or "пиксел" in str(exc).lower()
+        ):
             message = f"⚠️ {str(exc)}"
         else:
             message = (
                 "😕 Не удалось подготовить комплект. "
                 "Кредит возвращён, если база данных доступна.\n\n"
-                "Попробуй позже. Если ошибка повторяется, "
-                "сообщи администратору."
+                "Попробуй позже. Если ошибка повторяется, сообщи администратору."
             )
 
         send_message(chat_id, message, main_keyboard())
@@ -1885,38 +1294,20 @@ def process_photo(
             busy_chats.discard(chat_id)
 
 
-def start_processing(
-    chat_id,
-    file_ids,
-    prompt,
-    style_id="minimal",
-    card_count=1
-):
+def start_processing(chat_id, file_ids, prompt, style_id="minimal", card_count=1):
     file_ids = list(file_ids)[:MAX_REFERENCE_PHOTOS]
-
     with state_lock:
         if chat_id in busy_chats:
-            send_message(
-                chat_id,
-                "⏳ Предыдущий комплект ещё обрабатывается."
-            )
+            send_message(chat_id, "⏳ Предыдущий комплект ещё обрабатывается.")
             return
-
         busy_chats.add(chat_id)
 
     thread = threading.Thread(
         target=process_photo,
-        args=(
-            chat_id,
-            file_ids,
-            prompt,
-            style_id,
-            card_count,
-        ),
+        args=(chat_id, file_ids, prompt, style_id, card_count),
         daemon=True,
         name=f"image-set-{chat_id}",
     )
-
     thread.start()
 
 
@@ -1931,7 +1322,7 @@ def help_text():
         "2. При желании отправь дополнительные ракурсы.\n"
         "3. Нажми «Фотографии загружены».\n"
         "4. Выбери стиль и количество карточек.\n"
-        "5. Напиши пожелания и реальные характеристики.\n\n"
+        "5. Напиши реальные характеристики и пожелания.\n\n"
         "Дополнительные ракурсы помогают точнее сохранить товар, "
         "но не гарантируют идеального воспроизведения.\n\n"
         "Один комплект из 1–7 карточек стоит 1 кредит."
@@ -1944,7 +1335,7 @@ def features_text():
         "📸 Обработка товарных фотографий\n"
         "🎨 10 визуальных стилей\n"
         "🧩 Комплекты от 1 до 7 карточек\n"
-        "📷 Поддержка нескольких ракурсов товара\n"
+        "📷 Несколько ракурсов одного товара\n"
         "📐 Фиксированные шаблоны текста\n"
         "🔤 Текст рисуется программно поверх изображения\n"
         "💳 Оплата через Telegram Stars\n\n"
@@ -1956,19 +1347,15 @@ def features_text():
 def admin_text(chat_id):
     if not is_admin(chat_id):
         return "Команда доступна только администратору."
-
     try:
         stats = get_admin_stats()
-
         with state_lock:
             runtime = dict(runtime_stats)
             busy_count = len(busy_chats)
-
         event_lines = "\n".join(
             f"• {name}: {count}"
             for name, count in sorted(stats["events_7d"].items())
         ) or "Нет событий"
-
         return (
             "👑 Статистика TovarPix\n\n"
             f"Пользователей: {stats['users']}\n"
@@ -1976,16 +1363,12 @@ def admin_text(chat_id):
             f"Платежей: {stats['payment_count']}\n"
             f"Получено Stars: {stats['stars_total']}\n"
             f"Продано комплектов: {stats['credits_sold']}\n\n"
-            "События за 7 дней:\n"
-            + event_lines
-            + "\n\n"
+            "События за 7 дней:\n" + event_lines + "\n\n"
             f"Сейчас обрабатывается: {busy_count}\n"
             f"Успешных комплектов: {runtime['images_succeeded']}\n"
             f"Ошибок: {runtime['images_failed']}\n"
-            f"Последний успех: "
-            f"{runtime['last_success_at'] or 'ещё не было'}"
+            f"Последний успех: {runtime['last_success_at'] or 'ещё не было'}"
         )
-
     except Exception:
         logger.exception("Could not build admin stats")
         return "Не удалось загрузить статистику."
@@ -2003,7 +1386,6 @@ def handle_command_or_text(chat_id, message, text):
             reset_keyboard(chat_id)
         except Exception:
             logger.exception("Could not remove previous keyboard")
-
         send_message(
             chat_id,
             "Привет! 👋 Я TovarPix — AI-редактор товарных фото.\n\n"
@@ -2011,19 +1393,17 @@ def handle_command_or_text(chat_id, message, text):
             "📷 Можешь прислать дополнительные ракурсы.\n"
             "🎨 Выбери один из 10 стилей.\n"
             "🧩 Укажи от 1 до 7 карточек.\n\n"
-            "Текст на карточках размещается программно "
-            "в фиксированных областях шаблона.\n\n"
+            "Текст размещается программно в фиксированных областях шаблона.\n\n"
             "🎁 Доступен один бесплатный комплект.\n"
             "⭐ Пять дополнительных комплектов стоят 5 Stars.",
-            main_keyboard()
+            main_keyboard(),
         )
         return
 
     if command == "/myid":
         send_message(
             chat_id,
-            f"Твой Telegram ID: {chat_id}\n"
-            "Для безлимита добавь ID в ADMIN_IDS в Render."
+            f"Твой Telegram ID: {chat_id}\nДля безлимита добавь ID в ADMIN_IDS в Render.",
         )
         return
 
@@ -2037,11 +1417,7 @@ def handle_command_or_text(chat_id, message, text):
 
     if command == "/balance" or text == "💰 Баланс":
         try:
-            send_message(
-                chat_id,
-                user_balance_text(get_balance(chat_id)),
-                main_keyboard()
-            )
+            send_message(chat_id, user_balance_text(get_balance(chat_id)), main_keyboard())
         except Exception:
             logger.exception("Could not read balance")
             send_message(chat_id, "Не удалось загрузить баланс.")
@@ -2059,12 +1435,7 @@ def handle_command_or_text(chat_id, message, text):
         with state_lock:
             pending_photos.pop(chat_id, None)
             pending_jobs.pop(chat_id, None)
-
-        send_message(
-            chat_id,
-            "Ожидание отменено. Можешь начать заново.",
-            main_keyboard()
-        )
+        send_message(chat_id, "Ожидание отменено. Можешь начать заново.", main_keyboard())
         return
 
     if command == "/example" or text == "💡 Пример промпта":
@@ -2076,9 +1447,8 @@ def handle_command_or_text(chat_id, message, text):
             "• Светлый интерьер и дневной свет.\n"
             "• Минималистичная композиция.\n"
             "• Заголовок и плашки с указанными характеристиками.\n\n"
-            "Не указывай вымышленные характеристики."
-            ,
-            main_keyboard()
+            "Не указывай вымышленные характеристики.",
+            main_keyboard(),
         )
         return
 
@@ -2090,9 +1460,8 @@ def handle_command_or_text(chat_id, message, text):
         send_message(
             chat_id,
             "🔒 Фотографии передаются внешнему сервису обработки. "
-            "Не отправляй конфиденциальные изображения. "
-            "Проверяй результат перед публикацией.",
-            main_keyboard()
+            "Не отправляй конфиденциальные изображения. Проверяй результат перед публикацией.",
+            main_keyboard(),
         )
         return
 
@@ -2100,26 +1469,21 @@ def handle_command_or_text(chat_id, message, text):
         try:
             send_message(
                 chat_id,
-                "📊 Статус\n\n"
-                + user_balance_text(get_balance(chat_id))
+                "📊 Статус\n\n" + user_balance_text(get_balance(chat_id))
                 + "\n\nВремя работы: "
                 + format_duration(time.time() - APP_STARTED_AT),
-                main_keyboard()
+                main_keyboard(),
             )
         except Exception:
             logger.exception("Status command failed")
             send_message(chat_id, "Статус временно недоступен.")
         return
 
-    send_message(
-        chat_id,
-        "Не понял команду. Нажми «❓ Помощь».",
-        main_keyboard()
-    )
+    send_message(chat_id, "Не понял команду. Нажми «❓ Помощь».", main_keyboard())
 
 
 # ============================================================
-# КНОПКИ: СБОР ФОТО, СТИЛЬ, КОЛИЧЕСТВО
+# CALLBACK-КНОПКИ
 # ============================================================
 
 def handle_callback_query(callback):
@@ -2132,21 +1496,18 @@ def handle_callback_query(callback):
         return
 
     with state_lock:
-        file_ids = pending_photos.get(chat_id, [])
+        file_ids = list(pending_photos.get(chat_id, []))
         job = pending_jobs.get(chat_id)
 
     if data == "photos:help":
         answer_callback_query(callback_id)
-
         send_message(
             chat_id,
             "📷 Лучше прислать:\n\n"
-            "• Вид спереди.\n"
-            "• Вид сзади.\n"
-            "• Вид сбоку.\n"
+            "• Вид спереди.\n• Вид сзади.\n• Вид сбоку.\n"
             "• Крупный план логотипа или важных деталей.\n\n"
-            "Присылай только фотографии этого же товара. "
-            "Если есть лишь одно фото, можешь продолжить с ним."
+            "Присылай фотографии одного и того же товара. "
+            "Если есть лишь одно фото, продолжай с ним.",
         )
         return
 
@@ -2154,100 +1515,66 @@ def handle_callback_query(callback):
         if not file_ids:
             answer_callback_query(callback_id, "Сначала отправь фото")
             return
-
         with state_lock:
             pending_jobs[chat_id] = {
-                "stage": "style",
-                "style_id": None,
-                "card_count": None,
+                "stage": "style", "style_id": None, "card_count": None,
             }
-
-        answer_callback_query(
-            callback_id,
-            f"Фотографий: {len(file_ids)}"
-        )
-
+        answer_callback_query(callback_id, f"Фотографий: {len(file_ids)}")
         send_message(
             chat_id,
-            f"✅ Собрано фотографий: {len(file_ids)}.\n\n"
-            "Теперь выбери стиль карточек.",
-            style_keyboard()
+            f"✅ Собрано фотографий: {len(file_ids)}.\n\nТеперь выбери стиль карточек.",
+            style_keyboard(),
         )
         return
 
     if not file_ids or not job:
         answer_callback_query(callback_id, "Сначала отправь фото товара")
-        send_message(
-            chat_id,
-            "Сначала отправь фотографию товара.",
-            main_keyboard()
-        )
+        send_message(chat_id, "Сначала отправь фотографию товара.", main_keyboard())
         return
 
     if data.startswith("style:"):
         style_id = data.split(":", 1)[1]
-
         if style_id not in STYLE_OPTIONS:
             answer_callback_query(callback_id, "Неизвестный стиль")
             return
-
         with state_lock:
             job["style_id"] = style_id
             job["stage"] = "count"
             pending_jobs[chat_id] = job
-
-        answer_callback_query(
-            callback_id,
-            f"Выбран стиль: {STYLE_OPTIONS[style_id]['name']}"
-        )
-
+        answer_callback_query(callback_id, f"Выбран стиль: {STYLE_OPTIONS[style_id]['name']}")
         send_message(
             chat_id,
             f"Выбран стиль: {STYLE_OPTIONS[style_id]['emoji']} "
             f"{STYLE_OPTIONS[style_id]['name']}\n\n"
             "Сколько карточек сделать? Весь комплект стоит 1 кредит.",
-            count_keyboard()
+            count_keyboard(),
         )
         return
 
     if data.startswith("count:"):
         count = safe_int(data.split(":", 1)[1], 0)
-
-        if count < 1 or count > 7:
-            answer_callback_query(
-                callback_id,
-                "Можно выбрать от 1 до 7"
-            )
+        if not 1 <= count <= 7:
+            answer_callback_query(callback_id, "Можно выбрать от 1 до 7")
             return
-
         with state_lock:
             if not job.get("style_id"):
                 answer_callback_query(callback_id, "Сначала выбери стиль")
-                send_message(
-                    chat_id,
-                    "Сначала выбери стиль карточек.",
-                    style_keyboard()
-                )
+                send_message(chat_id, "Сначала выбери стиль карточек.", style_keyboard())
                 return
-
             job["card_count"] = count
             job["stage"] = "prompt"
             pending_jobs[chat_id] = job
-
         answer_callback_query(callback_id, f"Карточек: {count}")
-
         send_message(
             chat_id,
             f"📦 Комплект: {count} карточек.\n"
             f"🎨 Стиль: {STYLE_OPTIONS[job['style_id']]['name']}\n"
             f"📷 Фотографий: {len(file_ids)}\n"
             "💳 Стоимость: 1 кредит.\n\n"
-            "Теперь напиши реальные характеристики товара "
-            "и пожелания к оформлению.\n\n"
-            "Если дополнительных пожеланий нет, напиши "
-            "«Стандартно».\n\n"
+            "Теперь напиши реальные характеристики товара и пожелания к оформлению.\n\n"
+            "Если пожеланий нет, напиши «Стандартно».\n"
             "Для отмены нажми «❌ Отмена».",
-            main_keyboard()
+            main_keyboard(),
         )
         return
 
@@ -2271,12 +1598,10 @@ def handle_update(update):
         return
 
     message = update.get("message")
-
     if not message:
         return
 
     chat_id = message.get("chat", {}).get("id")
-
     if not chat_id:
         return
 
@@ -2285,10 +1610,7 @@ def handle_update(update):
         return
 
     if not allow_message_rate(chat_id):
-        send_message(
-            chat_id,
-            "⏳ Слишком много сообщений подряд. Подожди немного."
-        )
+        send_message(chat_id, "⏳ Слишком много сообщений подряд. Подожди немного.")
         return
 
     text = (message.get("text") or "").strip()
@@ -2296,55 +1618,38 @@ def handle_update(update):
     if message.get("photo"):
         with state_lock:
             if chat_id in busy_chats:
-                send_message(
-                    chat_id,
-                    "⏳ Дождись завершения предыдущей обработки."
-                )
+                send_message(chat_id, "⏳ Дождись завершения предыдущей обработки.")
                 return
 
             job = pending_jobs.get(chat_id)
-
-            if job and job.get("stage") in (
-                "style", "count", "prompt"
-            ):
+            if job and job.get("stage") in ("style", "count", "prompt"):
                 send_message(
                     chat_id,
                     "Ты уже подтвердил фотографии и начал настройку. "
-                    "Нажми «❌ Отмена», чтобы начать заново."
+                    "Нажми «❌ Отмена», чтобы начать заново.",
                 )
                 return
 
             file_id = message["photo"][-1]["file_id"]
-
-            if chat_id not in pending_photos:
-                pending_photos[chat_id] = []
+            pending_photos.setdefault(chat_id, [])
 
             if len(pending_photos[chat_id]) >= MAX_REFERENCE_PHOTOS:
-                send_message(
-                    chat_id,
-                    f"Можно использовать максимум "
-                    f"{MAX_REFERENCE_PHOTOS} фотографий."
-                )
+                send_message(chat_id, f"Можно использовать максимум {MAX_REFERENCE_PHOTOS} фотографий.")
                 return
 
             pending_photos[chat_id].append(file_id)
-
             count = len(pending_photos[chat_id])
-
             pending_jobs[chat_id] = {
-                "stage": "photos",
-                "style_id": None,
-                "card_count": None,
+                "stage": "photos", "style_id": None, "card_count": None,
             }
 
         send_message(
             chat_id,
             f"📸 Фотография {count}/{MAX_REFERENCE_PHOTOS} получена.\n\n"
-            "Можешь отправить ещё фотографии того же товара "
-            "с других сторон. Когда закончишь, нажми кнопку ниже.\n\n"
-            "Если у тебя только одно фото, просто нажми "
-            "«Фотографии загружены».",
-            photo_collection_keyboard()
+            "Можешь отправить ещё фотографии этого же товара с других сторон. "
+            "Когда закончишь, нажми кнопку ниже.\n\n"
+            "Если у тебя только одно фото, нажми «Фотографии загружены».",
+            photo_collection_keyboard(),
         )
         return
 
@@ -2352,87 +1657,53 @@ def handle_update(update):
         with state_lock:
             file_ids = list(pending_photos.get(chat_id, []))
             job = pending_jobs.get(chat_id, {})
-
             ready = bool(
                 file_ids
                 and job.get("stage") == "prompt"
                 and job.get("style_id")
                 and job.get("card_count")
             )
-
             if ready:
                 pending_photos.pop(chat_id, None)
                 pending_jobs.pop(chat_id, None)
 
         if ready:
-            prompt = (
-                ""
-                if text.lower() in (
-                    "стандартно",
-                    "без пожеланий",
-                    "по умолчанию",
-                )
-                else text
-            )
-
-            start_processing(
-                chat_id,
-                file_ids,
-                prompt,
-                job["style_id"],
-                job["card_count"],
-            )
-
+            prompt = "" if text.lower() in (
+                "стандартно", "без пожеланий", "по умолчанию"
+            ) else text
+            start_processing(chat_id, file_ids, prompt, job["style_id"], job["card_count"])
         elif file_ids:
             stage = job.get("stage", "photos")
-
             if stage == "photos":
-                send_message(
-                    chat_id,
-                    "Сначала закончи загрузку фотографий кнопкой ниже.",
-                    photo_collection_keyboard()
-                )
-
+                send_message(chat_id, "Сначала закончи загрузку фотографий кнопкой ниже.", photo_collection_keyboard())
             elif stage == "style":
-                send_message(
-                    chat_id,
-                    "Сначала выбери стиль.",
-                    style_keyboard()
-                )
-
+                send_message(chat_id, "Сначала выбери стиль.", style_keyboard())
             elif stage == "count":
-                send_message(
-                    chat_id,
-                    "Выбери количество от 1 до 7.",
-                    count_keyboard()
-                )
-
+                send_message(chat_id, "Выбери количество от 1 до 7.", count_keyboard())
             else:
-                send_message(
-                    chat_id,
-                    "Выбери стиль и количество карточек, "
-                    "затем напиши пожелания."
-                )
-
+                send_message(chat_id, "Выбери стиль и количество карточек, затем напиши пожелания.")
         else:
             handle_command_or_text(chat_id, message, text)
-
         return
 
     if text.startswith("/"):
         handle_command_or_text(chat_id, message, text)
         return
 
-    send_message(
-        chat_id,
-        "Отправь фотографию товара, чтобы начать.",
-        main_keyboard()
-    )
+    send_message(chat_id, "Отправь фотографию товара, чтобы начать.", main_keyboard())
 
 
 # ============================================================
 # WEBHOOK И СЛУЖЕБНЫЕ ENDPOINTS
 # ============================================================
+
+def admin_endpoint_allowed():
+    # Если секрет не настроен, служебные endpoints не открываются наружу.
+    if not ADMIN_ENDPOINT_SECRET:
+        return False
+    supplied = request.headers.get("X-Admin-Secret", "") or request.args.get("secret", "")
+    return supplied == ADMIN_ENDPOINT_SECRET
+
 
 @app.route("/", methods=["GET"])
 def home():
@@ -2454,32 +1725,23 @@ def ready():
     try:
         with db_connect() as conn:
             conn.execute("SELECT 1")
-
-        return jsonify({
-            "ready": True,
-            "database": "ok",
-        }), 200
-
+        return jsonify({"ready": True, "database": "ok"}), 200
     except Exception:
         logger.exception("Readiness check failed")
-
-        return jsonify({
-            "ready": False,
-            "database": "error",
-        }), 503
+        return jsonify({"ready": False, "database": "error"}), 503
 
 
 @app.route("/bot_info", methods=["GET"])
 def bot_info():
+    if not admin_endpoint_allowed():
+        return jsonify({"error": "Forbidden"}), 403
     try:
         me = telegram_api("getMe")
-
         return jsonify({
             "username": me.get("username"),
             "first_name": me.get("first_name"),
             "id": me.get("id"),
         }), 200
-
     except Exception:
         logger.exception("Bot info failed")
         return jsonify({"error": "Telegram API error"}), 500
@@ -2488,11 +1750,7 @@ def bot_info():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if WEBHOOK_SECRET:
-        supplied = request.headers.get(
-            "X-Telegram-Bot-Api-Secret-Token",
-            ""
-        )
-
+        supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if supplied != WEBHOOK_SECRET:
             logger.warning("Rejected webhook request with invalid secret")
             return "Forbidden", 403
@@ -2502,13 +1760,10 @@ def webhook():
 
     try:
         payload = request.get_json(silent=False)
-
         if not isinstance(payload, dict):
             return "Expected JSON object", 400
-
         handle_update(payload)
         return "OK", 200
-
     except Exception:
         logger.exception("Webhook handler failed")
         return "Internal Server Error", 500
@@ -2516,18 +1771,18 @@ def webhook():
 
 @app.route("/set_webhook", methods=["GET"])
 def set_webhook():
+    if not admin_endpoint_allowed():
+        return "Forbidden: set ADMIN_ENDPOINT_SECRET and pass it as ?secret=", 403
     if not RENDER_URL:
         return "Render URL is not configured", 500
 
     data = {"url": f"{RENDER_URL}/webhook"}
-
     if WEBHOOK_SECRET:
         data["secret_token"] = WEBHOOK_SECRET
 
     try:
         telegram_api("setWebhook", data)
         return "Webhook configured", 200
-
     except Exception:
         logger.exception("Webhook setup failed")
         return "Webhook setup error", 500
@@ -2535,20 +1790,18 @@ def set_webhook():
 
 @app.route("/webhook_status", methods=["GET"])
 def webhook_status():
+    if not admin_endpoint_allowed():
+        return jsonify({"error": "Forbidden"}), 403
     try:
         info = telegram_api("getWebhookInfo")
-
         return jsonify({
             "url_configured": bool(info.get("url")),
-            "url_matches_render": (
-                info.get("url") == f"{RENDER_URL}/webhook"
-            ),
+            "url_matches_render": info.get("url") == f"{RENDER_URL}/webhook",
             "pending_update_count": info.get("pending_update_count"),
             "last_error_date": info.get("last_error_date"),
             "last_error_message": info.get("last_error_message"),
             "max_connections": info.get("max_connections"),
         }), 200
-
     except Exception:
         logger.exception("Webhook status failed")
         return jsonify({"error": "Telegram API error"}), 500
@@ -2556,12 +1809,11 @@ def webhook_status():
 
 @app.route("/runtime_stats", methods=["GET"])
 def runtime_stats_route():
+    if not admin_endpoint_allowed():
+        return jsonify({"error": "Forbidden"}), 403
     with state_lock:
         stats = dict(runtime_stats)
         stats["busy_count"] = len(busy_chats)
-
-    stats.pop("last_error", None)
-
     return jsonify({
         "uptime_seconds": int(time.time() - APP_STARTED_AT),
         "stats": stats,
