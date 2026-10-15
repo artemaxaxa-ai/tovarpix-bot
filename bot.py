@@ -15,7 +15,10 @@ from collections import defaultdict, deque
 import requests
 import psycopg
 from flask import Flask, request, jsonify
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFile, ImageFilter, ImageChops
+from PIL import (
+    Image, ImageDraw, ImageFont, ImageOps, ImageFile, ImageFilter,
+    ImageChops, ImageStat, ImageEnhance,
+)
 from magic_hour import Client
 
 # ============================================================
@@ -70,6 +73,12 @@ def aspect_ratio_value(text):
 
 
 PORTRAIT_MODE = aspect_ratio_value(MH_ASPECT) < 0.95
+
+# cutout — настоящий товар вырезается и ставится на студийный фон (по умолчанию).
+# ai     — старый режим: нейросеть перерисовывает весь кадр.
+CARD_MODE = os.environ.get("CARD_MODE", "cutout").strip().lower()
+if CARD_MODE not in ("cutout", "ai"):
+    CARD_MODE = "cutout"
 APP_STARTED_AT = time.time()
 
 if not TOKEN:
@@ -1260,6 +1269,42 @@ def draw_text_layout(draw, box, layout, style):
             y += layout["item_gap"]
 
 
+def apply_style_decor(canvas, kind):
+    W, H = canvas.size
+    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+
+    if kind == "luxury":
+        od.rectangle((20, 20, W - 21, H - 21), outline=(215, 181, 109, 230), width=3)
+        od.rectangle((34, 34, W - 35, H - 35), outline=(215, 181, 109, 100), width=1)
+    elif kind == "tech":
+        for gx in range(35, W, 90):
+            od.line((gx, 0, gx, H), fill=(101, 214, 255, 38), width=1)
+        for gy in range(35, H, 90):
+            od.line((0, gy, W, gy), fill=(101, 214, 255, 32), width=1)
+        od.line((35, 35, 180, 35), fill=(101, 214, 255, 220), width=4)
+    elif kind == "eco":
+        od.ellipse((W - 235, 35, W - 45, 225), outline=(164, 185, 153, 180), width=3)
+    elif kind == "pop":
+        od.ellipse((25, 30, 130, 135), fill=(232, 200, 77, 190))
+        od.ellipse((W - 145, 45, W - 50, 140), fill=(164, 138, 240, 170))
+    elif kind == "fashion":
+        od.line((45, 42, W - 45, 42), fill=(255, 255, 255, 220), width=2)
+        od.line((45, H - 42, W - 45, H - 42), fill=(255, 255, 255, 220), width=2)
+    elif kind == "market":
+        od.polygon([(0, 0), (230, 0), (0, 170)], fill=(255, 226, 165, 200))
+    elif kind == "info":
+        od.rounded_rectangle((25, 25, W - 25, H - 25), radius=28, outline=(184, 203, 227, 210), width=3)
+    elif kind == "cinematic":
+        for y in range(250):
+            alpha = int(100 * (1 - y / 250))
+            od.line((0, y, W, y), fill=(0, 0, 0, alpha))
+            od.line((0, H - 1 - y, W, H - 1 - y), fill=(0, 0, 0, alpha))
+
+    canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay).convert("RGB")
+    return canvas
+
+
 def render_ad_card(
     image_bytes,
     text,
@@ -1303,38 +1348,7 @@ def render_ad_card(
         )
         canvas.paste(product, (px, py), mask)
 
-    # 3. Декор стиля.
-    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
-
-    if kind == "luxury":
-        od.rectangle((20, 20, W - 21, H - 21), outline=(215, 181, 109, 230), width=3)
-        od.rectangle((34, 34, W - 35, H - 35), outline=(215, 181, 109, 100), width=1)
-    elif kind == "tech":
-        for gx in range(35, W, 90):
-            od.line((gx, 0, gx, H), fill=(101, 214, 255, 38), width=1)
-        for gy in range(35, H, 90):
-            od.line((0, gy, W, gy), fill=(101, 214, 255, 32), width=1)
-        od.line((35, 35, 180, 35), fill=(101, 214, 255, 220), width=4)
-    elif kind == "eco":
-        od.ellipse((W - 235, 35, W - 45, 225), outline=(164, 185, 153, 180), width=3)
-    elif kind == "pop":
-        od.ellipse((25, 30, 130, 135), fill=(232, 200, 77, 190))
-        od.ellipse((W - 145, 45, W - 50, 140), fill=(164, 138, 240, 170))
-    elif kind == "fashion":
-        od.line((45, 42, W - 45, 42), fill=(255, 255, 255, 220), width=2)
-        od.line((45, H - 42, W - 45, H - 42), fill=(255, 255, 255, 220), width=2)
-    elif kind == "market":
-        od.polygon([(0, 0), (230, 0), (0, 170)], fill=(255, 226, 165, 200))
-    elif kind == "info":
-        od.rounded_rectangle((25, 25, W - 25, H - 25), radius=28, outline=(184, 203, 227, 210), width=3)
-    elif kind == "cinematic":
-        for y in range(250):
-            alpha = int(100 * (1 - y / 250))
-            od.line((0, y, W, y), fill=(0, 0, 0, alpha))
-            od.line((0, H - 1 - y, W, H - 1 - y), fill=(0, 0, 0, alpha))
-
-    canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay).convert("RGB")
+    canvas = apply_style_decor(canvas, kind)
 
     # 4. Текстовая плашка — строго в своей зоне, товар не перекрывает.
     draw = ImageDraw.Draw(canvas)
@@ -1355,6 +1369,292 @@ def render_ad_card(
         fill=style["panel"],
         outline=style["border"],
         width=1,
+    )
+    draw.text(
+        (W - iw - 31, badge_top + 5),
+        index_text, font=index_font, fill=style["text"],
+    )
+
+    output = io.BytesIO()
+    canvas.save(output, format="JPEG", quality=93, optimize=True, progressive=True)
+    output.seek(0)
+    return output
+
+
+# ============================================================
+# CUTOUT MODE — НАСТОЯЩИЙ ТОВАР НА СТУДИЙНОМ ФОНЕ
+# ============================================================
+
+CARD_VARIANTS = [
+    {"scale": 1.00, "dx": 0, "light_x": 0.50},
+    {"scale": 0.90, "dx": -30, "light_x": 0.30},
+    {"scale": 0.95, "dx": 30, "light_x": 0.70},
+    {"scale": 0.82, "dx": 0, "light_x": 0.50},
+    {"scale": 1.00, "dx": -20, "light_x": 0.35},
+    {"scale": 0.88, "dx": 20, "light_x": 0.65},
+    {"scale": 0.96, "dx": 0, "light_x": 0.50},
+]
+
+GLOW_COLORS = {
+    "minimal": (255, 255, 255), "luxury": (215, 181, 109),
+    "cozy": (255, 240, 215), "market": (255, 255, 255),
+    "tech": (101, 214, 255), "eco": (255, 255, 240),
+    "fashion": (255, 255, 255), "info": (255, 255, 255),
+    "pop": (255, 255, 255), "cinematic": (255, 190, 130),
+}
+
+
+def remove_background(image_bytes):
+    """Magic Hour вырезает товар: возвращает PNG с прозрачным фоном."""
+    normalized = normalize_image_bytes(image_bytes, max_side=2048, quality=95)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        source_path = Path(temp_dir) / "product.jpg"
+        source_path.write_bytes(normalized)
+
+        result = magic_client.v1.image_background_remover.generate(
+            assets={"image_file_path": str(source_path)},
+            name="TovarPix cutout",
+            wait_for_completion=True,
+            download_outputs=True,
+            download_directory=temp_dir,
+        )
+
+        if getattr(result, "status", None) != "complete":
+            error = getattr(result, "error", None)
+            if error:
+                raise RuntimeError(
+                    f"Magic Hour: {getattr(error, 'code', 'error')}: "
+                    f"{getattr(error, 'message', str(error))}"
+                )
+            raise RuntimeError(
+                f"Вырезка завершилась со статусом: {getattr(result, 'status', 'unknown')}"
+            )
+
+        output_paths = getattr(result, "downloaded_paths", None)
+        if not output_paths:
+            raise RuntimeError("Magic Hour не вернул вырезанный товар")
+        output_path = Path(str(output_paths[0]))
+        if not output_path.is_file():
+            raise RuntimeError("Не найден файл с вырезанным товаром")
+        return output_path.read_bytes()
+
+
+def load_cutout(png_bytes):
+    """Готовит вырезку: прозрачный фон, обрезка по границам товара, мягкие края."""
+    inspect_image(png_bytes)
+    with Image.open(io.BytesIO(png_bytes)) as opened:
+        image = ImageOps.exif_transpose(opened).convert("RGBA")
+        image.thumbnail((2400, 2400), Image.Resampling.LANCZOS)
+        image = image.copy()
+
+    alpha = image.getchannel("A")
+    if alpha.getextrema()[0] >= 250:
+        raise RuntimeError("Magic Hour вернул картинку без прозрачного фона")
+
+    alpha = alpha.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(0.8))
+    image.putalpha(alpha)
+
+    box = alpha.point(lambda v: 255 if v > 12 else 0).getbbox()
+    if not box:
+        raise RuntimeError("На фото не найден товар")
+    return image.crop(box)
+
+
+def enhance_product(image):
+    """Лёгкая коррекция: подсветить тёмное фото, чуть контраста и резкости."""
+    alpha = image.getchannel("A")
+    rgb = image.convert("RGB")
+    try:
+        mask = alpha.point(lambda v: 255 if v > 128 else 0)
+        mean = ImageStat.Stat(rgb.convert("L"), mask=mask).mean[0]
+    except Exception:
+        mean = 128.0
+    factor = max(1.0, min(1.18, 85.0 / max(mean, 1.0)))
+    rgb = ImageEnhance.Brightness(rgb).enhance(factor)
+    rgb = ImageEnhance.Contrast(rgb).enhance(1.04)
+    rgb = ImageEnhance.Sharpness(rgb).enhance(1.25)
+    result = rgb.convert("RGBA")
+    result.putalpha(alpha)
+    return result
+
+
+def product_zone(position, layout):
+    """Прямоугольник, в котором можно размещать товар (вне текстовой плашки)."""
+    W, H, M = CARD_W, CARD_H, CARD_MARGIN
+    if not layout or position == "none":
+        return (0, 0, W, H)
+    pw, ph = layout["w"], layout["h"]
+    if position == "top":
+        return (0, ph + M * 2, W, H)
+    if position == "bottom":
+        return (0, 0, W, H - (ph + M * 2))
+    if position == "left":
+        return (pw + M * 2, 0, W, H)
+    return (0, 0, W - (pw + M * 2), H)
+
+
+def build_studio_background(style, variant, cx, cy, floor_y, prod_w, prod_h):
+    W, H = CARD_W, CARD_H
+    kind = style["kind"]
+    accent = hex_to_rgb(style["accent"], (120, 120, 120))
+    dark = sum(hex_to_rgb(style["top"])) / 3 < 100
+
+    base = Image.new("RGB", (W, H))
+    draw_gradient(base, (0, 0, W, H), style["top"], style["bottom"])
+    canvas = base.convert("RGBA")
+
+    def new_layer():
+        return Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+    # Мягкий источник света за товаром.
+    glow = new_layer()
+    lx = int(W * variant["light_x"])
+    ImageDraw.Draw(glow).ellipse(
+        (lx - 460, cy - 520, lx + 460, cy + 400),
+        fill=GLOW_COLORS.get(kind, (255, 255, 255)) + ((75 if dark else 120),),
+    )
+    canvas = Image.alpha_composite(canvas, glow.filter(ImageFilter.GaussianBlur(120)))
+
+    # Фигуры за товаром — разные у каждого стиля.
+    r = int(max(prod_w, prod_h) * 0.62)
+    shapes = new_layer()
+    sd = ImageDraw.Draw(shapes)
+    soft = kind in ("minimal", "cozy", "cinematic", "eco")
+
+    if kind == "market":
+        sd.ellipse((cx - r, cy - r, cx + r, cy + r), fill=accent + (235,))
+        sd.ellipse((cx + int(r * 0.75) - 55, cy - int(r * 0.85) - 55,
+                    cx + int(r * 0.75) + 55, cy - int(r * 0.85) + 55), fill=(255, 255, 255, 210))
+    elif kind == "pop":
+        sd.ellipse((cx + int(r * 0.1), cy + int(r * 0.1), cx + int(r * 1.0), cy + int(r * 1.0)),
+                   fill=(164, 138, 240, 200))
+        sd.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(232, 200, 77, 235))
+    elif kind == "tech":
+        for i in range(3):
+            rr = int(r * (0.75 + 0.22 * i))
+            sd.ellipse((cx - rr, cy - rr, cx + rr, cy + rr),
+                       outline=accent + (110 - i * 25,), width=3)
+    elif kind == "eco":
+        sd.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(255, 255, 255, 90),
+                   outline=accent + (140,), width=3)
+        sd.ellipse((cx - int(r * 1.5), cy + int(r * 0.2), cx - int(r * 0.9), cy + int(r * 0.8)),
+                   fill=accent + (50,))
+    elif kind == "fashion":
+        sd.rectangle((cx - int(r * 0.85), cy - int(r * 1.05), cx + int(r * 0.85), cy + int(r * 0.95)),
+                     fill=(255, 255, 255, 175))
+        sd.rectangle((cx - int(r * 0.85), cy - int(r * 1.05), cx - int(r * 0.85) + 5, cy + int(r * 0.95)),
+                     fill=accent + (255,))
+    elif kind == "info":
+        sd.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(255, 255, 255, 130))
+        for rr in (r, int(r * 0.75)):
+            sd.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), outline=accent + (70,), width=2)
+    elif kind == "cozy":
+        sd.ellipse((cx - int(r * 1.05), cy - int(r * 1.05), cx + int(r * 1.05), cy + int(r * 1.05)),
+                   fill=(255, 236, 205, 150))
+    elif kind == "minimal":
+        sd.ellipse((cx - int(r * 1.05), cy - int(r * 1.05), cx + int(r * 1.05), cy + int(r * 1.05)),
+                   fill=(255, 255, 255, 150))
+    elif kind == "luxury":
+        sd.ellipse((cx - r, cy - r, cx + r, cy + r), outline=accent + (120,), width=2)
+        rr = int(r * 1.12)
+        sd.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), outline=accent + (55,), width=1)
+    else:  # cinematic
+        sd.polygon([(cx - 70, 0), (cx + 70, 0), (cx + int(r * 1.2), floor_y),
+                    (cx - int(r * 1.2), floor_y)], fill=(255, 255, 255, 42))
+
+    if soft:
+        shapes = shapes.filter(ImageFilter.GaussianBlur(26))
+    canvas = Image.alpha_composite(canvas, shapes)
+
+    # Поверхность: затемнение к низу кадра и тонкая линия горизонта.
+    floor = new_layer()
+    fd = ImageDraw.Draw(floor)
+    band_top = max(0, floor_y - 30)
+    for yy in range(band_top, H):
+        t = (yy - band_top) / max(1, H - band_top)
+        fd.line((0, yy, W, yy), fill=(0, 0, 0, int((85 if dark else 40) * t)))
+    fd.line((0, band_top, W, band_top),
+            fill=(255, 255, 255, 40 if dark else 90), width=2)
+    canvas = Image.alpha_composite(canvas, floor)
+    return canvas.convert("RGB")
+
+
+def render_cutout_card(
+    cutout, text, style_id="minimal", position="bottom",
+    card_index=1, total_cards=1,
+):
+    style = STYLE_OPTIONS.get(style_id, STYLE_OPTIONS["minimal"])
+    kind = style["kind"]
+    W, H = CARD_W, CARD_H
+
+    layout = build_text_layout(text, position) if (text and position != "none") else None
+    if layout is None:
+        position = "none"
+    panel_box = compute_geometry(position, layout)[0]
+    zx0, zy0, zx1, zy1 = product_zone(position, layout)
+    variant = CARD_VARIANTS[(card_index - 1) % len(CARD_VARIANTS)]
+
+    product = enhance_product(cutout)
+    cw, ch = product.size
+
+    pad = 30 if position in ("left", "right") else 56
+    avail_w = max(100, zx1 - zx0 - 2 * pad)
+    avail_h = max(100, zy1 - zy0 - 2 * pad - 90)
+    scale = min(avail_w / cw, avail_h / ch, 2.0) * variant["scale"]
+    pw = max(1, int(cw * scale))
+    ph = max(1, int(ch * scale))
+    product = product.resize((pw, ph), Image.Resampling.LANCZOS)
+
+    x = zx0 + (zx1 - zx0 - pw) // 2 + variant["dx"]
+    x = max(zx0 + 10, min(x, zx1 - pw - 10))
+    y = zy0 + pad + (avail_h - ph) // 2 + 24
+    floor_y = y + int(ph * 0.82)
+
+    canvas = build_studio_background(
+        style, variant, x + pw // 2, y + ph // 2, floor_y, pw, ph
+    )
+    canvas = apply_style_decor(canvas, kind)
+
+    # Отражение на глянцевой поверхности (тёмные стили).
+    if kind in ("luxury", "tech", "cinematic"):
+        reflection = product.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+        fade = ImageOps.invert(Image.linear_gradient("L")).resize((pw, ph))
+        fade = fade.point(lambda v: int(v * 0.28))
+        reflection.putalpha(ImageChops.multiply(reflection.getchannel("A"), fade))
+        canvas.paste(reflection, (x, y + ph + 2), reflection)
+
+    # Тень от товара и контактная тень на поверхности.
+    drop = Image.new("L", (W, H), 0)
+    drop.paste(product.getchannel("A"), (x + 10, y + 22))
+    drop = drop.filter(ImageFilter.GaussianBlur(24)).point(lambda v: int(v * 0.38))
+    canvas.paste((0, 0, 0), (0, 0, W, H), drop)
+
+    contact = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(contact).ellipse(
+        (x + int(pw * 0.06), y + ph - int(ph * 0.03),
+         x + int(pw * 0.94), y + ph + int(ph * 0.07)),
+        fill=140,
+    )
+    contact = contact.filter(ImageFilter.GaussianBlur(16)).point(lambda v: int(v * 0.55))
+    canvas.paste((0, 0, 0), (0, 0, W, H), contact)
+
+    canvas.paste(product, (x, y), product)
+
+    draw = ImageDraw.Draw(canvas)
+    if layout and panel_box:
+        paste_panel_shadow(canvas, panel_box)
+        draw = ImageDraw.Draw(canvas)
+        draw_panel(draw, kind, panel_box, style)
+        draw_text_layout(draw, panel_box, layout, style)
+
+    index_font = load_font(17, True)
+    index_text = f"{card_index}/{total_cards}"
+    iw = text_width(draw, index_text, index_font)
+    badge_top = 36 if position == "bottom" else H - 52
+    draw.rounded_rectangle(
+        (W - iw - 42, badge_top, W - 20, badge_top + 32),
+        radius=12, fill=style["panel"], outline=style["border"], width=1,
     )
     draw.text(
         (W - iw - 31, badge_top + 5),
@@ -1421,6 +1721,52 @@ def space_instruction(text, position):
     )
 
 
+def build_card_ai(index, card_count, card_data, primary, image_bytes_list,
+                  style, prompt, style_id):
+    """Старый режим: нейросеть перерисовывает кадр целиком."""
+    role = CARD_ROLES[min(index - 1, len(CARD_ROLES) - 1)]
+    photo_total = len(image_bytes_list)
+    ordered = [image_bytes_list[primary]] + [
+        data for i, data in enumerate(image_bytes_list) if i != primary
+    ]
+
+    if photo_total > 1:
+        angle_note = (
+            "Reference image 1 is the PRIMARY view for this card: keep the "
+            "product at the same viewing angle and orientation as reference "
+            "image 1. Use the other references only to keep details accurate. "
+        )
+    else:
+        angle_note = "Keep the product at the same viewing angle as the reference. "
+
+    style_prompt = (
+        f"Create product photo {index} of {card_count}. "
+        f"Visual style: {style['name']}. "
+        f"Direction: {style['description']}. "
+        f"Composition role: {role}. "
+        + angle_note +
+        "All references show the same product. Preserve its exact identity, "
+        "geometry, proportions, color, materials, labels, logos, buttons, "
+        "camera count and details. Do not add text, prices, discounts, "
+        "badges or invented specifications inside the image. "
+        "Do not add ports, vents, slots or buttons that are not visible "
+        "on the references. "
+        "Change the background, environment, lighting and composition only. "
+        + space_instruction(card_data.get("text", ""), card_data.get("position", "bottom")) +
+        "User's visual instructions: " + prompt
+    )
+
+    generated = generate_product_image(ordered, style_prompt)
+    return render_ad_card(
+        generated.getvalue(),
+        card_data.get("text", ""),
+        style_id,
+        card_data.get("position", "bottom"),
+        index,
+        card_count,
+    )
+
+
 def process_photo(chat_id, file_ids, prompt, style_id, cards):
     credit_type = None
     started = time.monotonic()
@@ -1450,13 +1796,13 @@ def process_photo(chat_id, file_ids, prompt, style_id, cards):
 
         record_event(
             chat_id, "processing_started",
-            f"style={style_id};count={card_count};photos={len(file_ids)}",
+            f"mode={CARD_MODE};style={style_id};count={card_count};photos={len(file_ids)}",
         )
         send_message(
             chat_id,
             f"🎨 Начинаю комплект: {card_count} карточек.\n"
             f"Стиль: {style['emoji']} {style['name']}\n"
-            f"Фотографий-референсов: {len(file_ids)}\n\n"
+            f"Фотографий: {len(file_ids)}\n\n"
             "За весь комплект списывается 1 кредит. Это может занять несколько минут. "
             "Карточки буду присылать по мере готовности.",
         )
@@ -1472,55 +1818,33 @@ def process_photo(chat_id, file_ids, prompt, style_id, cards):
             image_bytes_list.append(data)
 
         photo_total = len(image_bytes_list)
+        cutouts = {}
 
         for index, card_data in enumerate(cards, start=1):
-            role = CARD_ROLES[min(index - 1, len(CARD_ROLES) - 1)]
-
-            # Какое фото — главное для этой карточки.
             primary = safe_int(card_data.get("photo_index"), (index - 1) % photo_total)
             if not 0 <= primary < photo_total:
                 primary = (index - 1) % photo_total
-            ordered = [image_bytes_list[primary]] + [
-                data for i, data in enumerate(image_bytes_list) if i != primary
-            ]
 
-            if photo_total > 1:
-                angle_note = (
-                    "Reference image 1 is the PRIMARY view for this card: keep the "
-                    "product at the same viewing angle and orientation as reference "
-                    "image 1. Use the other references only to keep details accurate. "
+            if CARD_MODE == "ai":
+                final_card = build_card_ai(
+                    index, card_count, card_data, primary,
+                    image_bytes_list, style, prompt, style_id,
                 )
             else:
-                angle_note = (
-                    "Keep the product at the same viewing angle as the reference. "
+                if primary not in cutouts:
+                    send_message(chat_id, f"✂️ Вырезаю товар с фото №{primary + 1}…")
+                    cutouts[primary] = load_cutout(
+                        remove_background(image_bytes_list[primary])
+                    )
+                final_card = render_cutout_card(
+                    cutouts[primary],
+                    card_data.get("text", ""),
+                    style_id,
+                    card_data.get("position", "bottom"),
+                    index,
+                    card_count,
                 )
 
-            style_prompt = (
-                f"Create product photo {index} of {card_count}. "
-                f"Visual style: {style['name']}. "
-                f"Direction: {style['description']}. "
-                f"Composition role: {role}. "
-                + angle_note +
-                "All references show the same product. Preserve its exact identity, "
-                "geometry, proportions, color, materials, labels, logos, buttons, "
-                "camera count and details. Do not add text, prices, discounts, "
-                "badges or invented specifications inside the image. "
-                "Do not add ports, vents, slots or buttons that are not visible "
-                "on the references. "
-                "Change the background, environment, lighting and composition only. "
-                + space_instruction(card_data.get("text", ""), card_data.get("position", "bottom")) +
-                "User's visual instructions: " + prompt
-            )
-
-            generated = generate_product_image(ordered, style_prompt)
-            final_card = render_ad_card(
-                generated.getvalue(),
-                card_data.get("text", ""),
-                style_id,
-                card_data.get("position", "bottom"),
-                index,
-                card_count,
-            )
             send_generated_photo(
                 chat_id,
                 final_card,
@@ -1623,6 +1947,8 @@ def help_text():
         "5. Укажи количество карточек от 1 до 7.\n"
         "6. Напиши пожелания к обработке фотографии.\n"
         "7. Для каждой карточки отдельно задай текст и его расположение.\n\n"
+        "Бот вырезает ваш настоящий товар и ставит его на студийный фон, "
+        "поэтому снимай товар на столе, а не в руке.\n"
         "Если загружено несколько ракурсов, каждая карточка делается по своему фото: "
         "1-я по первому, 2-я по второму и так далее.\n"
         "Текст наносится программно, поэтому нейросеть не рисует русские надписи.\n"
@@ -1820,6 +2146,12 @@ def handle_callback_query(callback):
             "📷 Лучше прислать фотографии одного товара:\n\n"
             "• Вид спереди.\n• Вид сзади.\n• Вид сбоку.\n"
             "• Крупный план логотипа или важных деталей.\n\n"
+            "Как снимать:\n"
+            "• Товар лежит на столе или ровной поверхности, НЕ в руке.\n"
+            "• Один товар в кадре, без лишних предметов рядом.\n"
+            "• Светлый однотонный фон, дневной свет, без вспышки.\n"
+            "• Товар крупно, целиком, без обрезанных краёв.\n"
+            "• Для лучшего качества отправляй как файл (JPEG/PNG).\n\n"
             "Каждая карточка комплекта будет сделана по своему фото. "
             "Если есть только одно фото, продолжай с ним.",
         )
@@ -1879,20 +2211,29 @@ def handle_callback_query(callback):
                 toast = "Эта кнопка сейчас недоступна"
             else:
                 job["card_count"] = count
-                job["stage"] = "prompt"
+                job["stage"] = "prompt" if CARD_MODE == "ai" else "card_text"
                 job["cards"] = []
                 job["card_index"] = 0
                 toast = f"Карточек: {count}"
-                messages.append((
+                summary = (
                     f"📦 Комплект: {count} карточек.\n"
                     f"🎨 Стиль: {STYLE_OPTIONS[job['style_id']]['name']}\n"
                     f"📷 Фотографий: {len(photos)}\n"
                     "💳 Стоимость: 1 кредит.\n\n"
-                    "Теперь напиши пожелания к обработке фотографий.\n"
-                    "Например: белая студия, мягкая тень, товар строго по центру.\n\n"
-                    "Если пожеланий нет, напиши «Стандартно».",
-                    main_keyboard(),
-                ))
+                )
+                if CARD_MODE == "ai":
+                    messages.append((
+                        summary
+                        + "Теперь напиши пожелания к обработке фотографий.\n"
+                        "Например: белая студия, мягкая тень, товар строго по центру.\n\n"
+                        "Если пожеланий нет, напиши «Стандартно».",
+                        main_keyboard(),
+                    ))
+                else:
+                    messages.append((
+                        summary + card_text_prompt(0, count, len(photos)),
+                        main_keyboard(),
+                    ))
 
         elif data.startswith("position:"):
             position = data.split(":", 1)[1]
@@ -1967,8 +2308,19 @@ def extract_chat_id(update):
     return None
 
 
-def handle_photo_message(chat_id, message):
-    file_id = message["photo"][-1]["file_id"]
+def extract_image_file_id(message):
+    """Фото из галереи или картинка, отправленная файлом (JPEG/PNG/WebP)."""
+    if message.get("photo"):
+        return message["photo"][-1]["file_id"]
+    document = message.get("document") or {}
+    if str(document.get("mime_type", "")).lower() in (
+        "image/jpeg", "image/png", "image/webp"
+    ):
+        return document.get("file_id")
+    return None
+
+
+def handle_photo_message(chat_id, file_id):
     reply = None
     count = 0
 
@@ -2122,8 +2474,17 @@ def process_update(update):
 
     text = (message.get("text") or "").strip()
 
-    if message.get("photo"):
-        handle_photo_message(chat_id, message)
+    image_file_id = extract_image_file_id(message)
+    if image_file_id:
+        handle_photo_message(chat_id, image_file_id)
+        return
+
+    if message.get("document"):
+        send_message(
+            chat_id,
+            "Этот файл не подходит. Отправь товар как обычное фото или как файл JPEG/PNG "
+            "(фото в формате HEIC бот не читает).",
+        )
         return
 
     # Кнопки нижнего меню и команды — ВСЕГДА команды, а не текст карточки.
