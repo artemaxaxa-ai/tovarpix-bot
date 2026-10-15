@@ -7,6 +7,7 @@ import logging
 import threading
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict, deque
@@ -14,7 +15,7 @@ from collections import defaultdict, deque
 import requests
 import psycopg
 from flask import Flask, request, jsonify
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFile
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFile, ImageFilter, ImageChops
 from magic_hour import Client
 
 # ============================================================
@@ -69,7 +70,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 
 http = requests.Session()
-http.headers.update({"User-Agent": "TovarPix/4.0"})
+http.headers.update({"User-Agent": "TovarPix/5.0"})
 magic_client = Client(token=MAGIC_HOUR_API_KEY)
 
 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
@@ -179,13 +180,25 @@ POSITION_OPTIONS = {
     "right": "Справа",
 }
 
-pending_photos = {}
-pending_jobs = {}
+MENU_TEXTS = {
+    "⭐ Купить 5 комплектов",
+    "💡 Пример промпта",
+    "💰 Баланс",
+    "❓ Помощь",
+    "📋 Возможности",
+    "❌ Отмена",
+}
+
+# Занятые чаты и статистика живут в памяти (это нормально: они не критичны
+# после перезапуска). Сценарий диалога теперь хранится в PostgreSQL.
 busy_chats = set()
 
 state_lock = threading.RLock()
 rate_lock = threading.Lock()
 message_times = defaultdict(deque)
+
+chat_locks = {}
+chat_locks_guard = threading.Lock()
 
 runtime_stats = {
     "updates": 0,
@@ -317,6 +330,21 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        # НОВОЕ: состояние диалога хранится в базе и переживает перезапуск.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                chat_id BIGINT PRIMARY KEY,
+                data TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        # Уборка старого мусора.
+        conn.execute(
+            "DELETE FROM processed_updates WHERE created_at < NOW() - INTERVAL '3 days'"
+        )
+        conn.execute(
+            "DELETE FROM sessions WHERE updated_at < NOW() - INTERVAL '2 days'"
+        )
     logger.info("PostgreSQL database is ready")
 
 
@@ -335,6 +363,79 @@ def record_event(chat_id, event_type, detail=""):
 
 init_db()
 
+
+# ------------------------------------------------------------
+# Сессии диалога (фото + настройки комплекта)
+# ------------------------------------------------------------
+
+def new_job(stage):
+    return {
+        "stage": stage,
+        "style_id": None,
+        "card_count": None,
+        "prompt": "",
+        "cards": [],
+        "card_index": 0,
+    }
+
+
+def get_chat_lock(chat_id):
+    with chat_locks_guard:
+        lock = chat_locks.get(chat_id)
+        if lock is None:
+            lock = threading.RLock()
+            chat_locks[chat_id] = lock
+        return lock
+
+
+def load_session(chat_id):
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT data FROM sessions WHERE chat_id = %s", (int(chat_id),)
+        ).fetchone()
+    if not row:
+        return {}
+    try:
+        data = json.loads(row[0])
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.exception("Broken session data, resetting")
+        return {}
+
+
+def save_session(chat_id, session):
+    with db_connect() as conn:
+        if not session:
+            conn.execute(
+                "DELETE FROM sessions WHERE chat_id = %s", (int(chat_id),)
+            )
+        else:
+            conn.execute(
+                """INSERT INTO sessions (chat_id, data, updated_at)
+                   VALUES (%s, %s, NOW())
+                   ON CONFLICT (chat_id)
+                   DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()""",
+                (int(chat_id), json.dumps(session, ensure_ascii=False)),
+            )
+
+
+@contextmanager
+def session_edit(chat_id):
+    """Читает сессию, даёт её менять и сохраняет. Один чат — одна очередь."""
+    with get_chat_lock(chat_id):
+        session = load_session(chat_id)
+        yield session
+        save_session(chat_id, session)
+
+
+def clear_session(chat_id):
+    with get_chat_lock(chat_id):
+        save_session(chat_id, {})
+
+
+# ------------------------------------------------------------
+# Пользователи и кредиты
+# ------------------------------------------------------------
 
 def ensure_user(chat_id):
     with db_connect() as conn:
@@ -725,6 +826,9 @@ recognizable and physically plausible.
 Do not add text, prices, discounts, specifications, watermarks or
 invented badges inside the generated photograph. Avoid floating objects,
 halos, fake reflections, distorted geometry and excessive glow.
+
+Keep the product centered with generous empty space around it, so a
+text panel can be placed next to the photo without covering the product.
 """
 
 
@@ -832,23 +936,15 @@ def fit_text(draw, text, font, max_width):
     return ""
 
 
-def wrap_text(draw, text, font, max_width, max_lines=3):
-    words = str(text or "").replace("\n", " \n ").split()
+def wrap_lines(draw, text, font, max_width, max_lines):
+    """Переносит текст по словам. Возвращает (строки, было_ли_обрезано)."""
+    words = str(text or "").split()
     lines = []
     current = ""
 
     for word in words:
-        if word == "\\n":
-            if current:
-                lines.append(current)
-                current = ""
-            if len(lines) >= max_lines:
-                break
-            continue
-
         if text_width(draw, word, font) > max_width:
             word = fit_text(draw, word, font, max_width)
-
         candidate = word if not current else current + " " + word
         if text_width(draw, candidate, font) <= max_width:
             current = candidate
@@ -856,19 +952,16 @@ def wrap_text(draw, text, font, max_width, max_lines=3):
             if current:
                 lines.append(current)
             current = word
-            if len(lines) >= max_lines:
-                break
-
-    if current and len(lines) < max_lines:
+    if current:
         lines.append(current)
 
-    if len(lines) == max_lines:
-        original = " ".join(str(text or "").split())
-        rendered = " ".join(lines)
-        if len(rendered) < len(original) and lines:
-            lines[-1] = fit_text(draw, lines[-1], font, max_width)
-
-    return lines[:max_lines]
+    truncated = len(lines) > max_lines
+    lines = lines[:max_lines]
+    if truncated and lines:
+        lines[-1] = fit_text(
+            draw, lines[-1].rstrip(" .,;:") + "…", font, max_width
+        )
+    return lines, truncated
 
 
 def draw_gradient(canvas, box, top_color, bottom_color):
@@ -893,122 +986,207 @@ def rounded_panel(draw, box, fill, outline, radius=24, width=2):
     )
 
 
-def add_text_block(canvas, text, style, position, card_index, total_cards):
-    """
-    Draws Russian text deterministically with Pillow.
-    User-provided text is not rewritten by the image model.
-    """
-    if not text or position == "none":
-        return canvas
+# ============================================================
+# CARD LAYOUT: ФОТО + ОТДЕЛЬНАЯ ЗОНА ПОД ТЕКСТ
+# ============================================================
 
-    draw = ImageDraw.Draw(canvas)
-    width, height = canvas.size
-    kind = style["kind"]
-    margin = 42
-    gap = 14
-    max_block_width = 440 if position in ("left", "right") else width - margin * 2
+CARD_W, CARD_H = 1080, 1350
+CARD_MARGIN = 36
+SIDE_PANEL_W = 380
+FEATHER = 130
 
-    lines_raw = [line.strip() for line in str(text).splitlines() if line.strip()]
+
+def build_text_layout(text, position):
+    """Заранее считает размеры текстовой плашки, чтобы выделить под неё место."""
+    lines_raw = [line.strip() for line in str(text or "").splitlines() if line.strip()]
     if not lines_raw:
-        return canvas
+        return None
 
-    title = lines_raw[0][:120]
-    body = " ".join(lines_raw[1:])[:250]
+    side = position in ("left", "right")
+    panel_w = SIDE_PANEL_W if side else CARD_W - CARD_MARGIN * 2
+    pad = 26
+    inner_w = panel_w - pad * 2
+    max_h = 1000 if side else 430
 
-    title_font_size = 42 if position in ("left", "right") else 46
-    title_font = load_font(title_font_size, True)
-    body_font = load_font(25, False)
+    measure = ImageDraw.Draw(Image.new("RGB", (10, 10)))
 
-    inner_padding = 26
-    text_width_limit = max_block_width - inner_padding * 2
-    title_lines = wrap_text(draw, title, title_font, text_width_limit, 3)
-    body_lines = wrap_text(draw, body, body_font, text_width_limit, 4) if body else []
+    title = " ".join(lines_raw[0].split())[:100]
+    title_sizes = (40, 36, 32, 28) if side else (52, 48, 44, 40, 36)
+    title_font = None
+    title_lines = []
+    title_size = title_sizes[-1]
+    for size in title_sizes:
+        title_font = load_font(size, True)
+        title_lines, truncated = wrap_lines(measure, title, title_font, inner_w, 3)
+        title_size = size
+        if not truncated:
+            break
 
-    title_line_height = 53
-    body_line_height = 34
-    block_height = inner_padding * 2 + len(title_lines) * title_line_height
-    if body_lines:
-        block_height += gap + len(body_lines) * body_line_height
+    body_size = 24 if side else 28
+    body_font = load_font(body_size, False)
+    bullet_indent = 24
+    body_items = []
+    for item in lines_raw[1:7]:
+        item = " ".join(item.split())[:110]
+        item_lines, _ = wrap_lines(
+            measure, item, body_font, inner_w - bullet_indent, 2
+        )
+        if item_lines:
+            body_items.append(item_lines)
 
-    block_height = min(block_height, height - margin * 2)
-    block_width = max_block_width
+    title_lh = int(title_size * 1.2)
+    body_lh = int(body_size * 1.35)
+    gap = 14
+    item_gap = 10
+
+    def total_height():
+        h = pad * 2 + len(title_lines) * title_lh
+        if body_items:
+            h += gap
+            h += sum(len(it) * body_lh for it in body_items)
+            h += item_gap * (len(body_items) - 1)
+        return h
+
+    while body_items and total_height() > max_h:
+        body_items.pop()
+
+    return {
+        "w": panel_w,
+        "h": min(total_height(), max_h),
+        "pad": pad,
+        "title_lines": title_lines,
+        "title_font": title_font,
+        "title_lh": title_lh,
+        "body_items": body_items,
+        "body_font": body_font,
+        "body_lh": body_lh,
+        "bullet_indent": bullet_indent,
+        "gap": gap,
+        "item_gap": item_gap,
+    }
+
+
+def compute_geometry(position, layout):
+    """Возвращает (рамка плашки или None, (x, y, сторона квадрата фото))."""
+    W, H, M = CARD_W, CARD_H, CARD_MARGIN
+
+    if not layout or position == "none":
+        side = W
+        return None, (0, (H - side) // 2, side)
+
+    pw, ph = layout["w"], layout["h"]
 
     if position == "top":
-        x0 = margin
-        y0 = margin
-        x1 = x0 + block_width
-        y1 = y0 + block_height
+        panel = (M, M, M + pw, M + ph)
+        zone = ph + M * 2
+        area_x, area_y, area_w, area_h = 0, zone, W, H - zone
     elif position == "bottom":
-        x0 = margin
-        x1 = x0 + block_width
-        y1 = height - margin
-        y0 = y1 - block_height
+        panel = (M, H - M - ph, M + pw, H - M)
+        zone = ph + M * 2
+        area_x, area_y, area_w, area_h = 0, 0, W, H - zone
     elif position == "left":
-        x0 = margin
-        y0 = max(margin, (height - block_height) // 2)
-        x1 = x0 + block_width
-        y1 = y0 + block_height
-    else:
-        x1 = width - margin
-        x0 = x1 - block_width
-        y0 = max(margin, (height - block_height) // 2)
-        y1 = y0 + block_height
+        panel = (M, (H - ph) // 2, M + pw, (H - ph) // 2 + ph)
+        side = min(H, W - (pw + M * 2) + 120)
+        return panel, (W - side, (H - side) // 2, side)
+    else:  # right
+        panel = (W - M - pw, (H - ph) // 2, W - M, (H - ph) // 2 + ph)
+        side = min(H, W - (pw + M * 2) + 120)
+        return panel, (0, (H - side) // 2, side)
 
+    side = min(area_w, area_h)
+    px = area_x + (area_w - side) // 2
+    py = area_y + (area_h - side) // 2
+    return panel, (px, py, side)
+
+
+def feather_mask(side, fade_left, fade_right, fade_top, fade_bottom):
+    """Маска с мягкими краями: фото плавно растворяется в фоне."""
+    mask = Image.new("L", (side, side), 255)
+    f = max(1, min(FEATHER, side // 4))
+
+    def strip(horizontal, reverse):
+        g = Image.new("L", (side, side), 255)
+        d = ImageDraw.Draw(g)
+        for i in range(f):
+            value = int(255 * i / f)
+            pos = (side - 1 - i) if reverse else i
+            if horizontal:
+                d.line((pos, 0, pos, side), fill=value)
+            else:
+                d.line((0, pos, side, pos), fill=value)
+        return g
+
+    if fade_left:
+        mask = ImageChops.multiply(mask, strip(True, False))
+    if fade_right:
+        mask = ImageChops.multiply(mask, strip(True, True))
+    if fade_top:
+        mask = ImageChops.multiply(mask, strip(False, False))
+    if fade_bottom:
+        mask = ImageChops.multiply(mask, strip(False, True))
+    return mask
+
+
+def draw_panel(draw, kind, box, style):
+    x0, y0, x1, y1 = box
     if kind == "minimal":
-        rounded_panel(draw, (x0, y0, x1, y1), "#FFFFFF", "#D7DDD7", 24, 2)
+        rounded_panel(draw, box, "#FFFFFF", "#D7DDD7", 24, 2)
     elif kind == "luxury":
-        draw.rectangle((x0, y0, x1, y1), fill="#11100E", outline="#D7B56D", width=3)
+        draw.rectangle(box, fill="#11100E", outline="#D7B56D", width=3)
         draw.rectangle((x0 + 9, y0 + 9, x1 - 9, y1 - 9), outline="#6F5B37", width=1)
     elif kind == "cozy":
-        rounded_panel(draw, (x0, y0, x1, y1), "#FFF7EA", "#E2C5A5", 32, 2)
+        rounded_panel(draw, box, "#FFF7EA", "#E2C5A5", 32, 2)
     elif kind == "market":
-        draw.rounded_rectangle((x0, y0, x1, y1), radius=12, fill="#FFFFFF")
+        draw.rounded_rectangle(box, radius=12, fill="#FFFFFF")
         draw.rounded_rectangle((x0, y0, x0 + 12, y1), radius=6, fill="#F05A28")
     elif kind == "tech":
-        draw.rectangle((x0, y0, x1, y1), fill="#111D2A", outline="#65D6FF", width=2)
-        draw.line((x0 + 18, y0 + 18, x1 - 18, y0 + 18), fill="#65D6FF", width=2)
+        draw.rectangle(box, fill="#111D2A", outline="#65D6FF", width=2)
+        draw.line((x0 + 18, y0 + 12, x1 - 18, y0 + 12), fill="#65D6FF", width=2)
     elif kind == "eco":
-        rounded_panel(draw, (x0, y0, x1, y1), "#F7F6E9", "#91A783", 28, 2)
-        draw.ellipse((x1 - 35, y0 + 15, x1 - 18, y0 + 32), fill="#4C8058")
+        rounded_panel(draw, box, "#F7F6E9", "#91A783", 28, 2)
+        draw.ellipse((x1 - 35, y0 + 10, x1 - 18, y0 + 27), fill="#4C8058")
     elif kind == "fashion":
-        draw.rectangle((x0, y0, x1, y1), fill="#FAF9F7", outline="#151515", width=2)
-        draw.line((x0 + 16, y0 + 16, x1 - 16, y0 + 16), fill="#C53A48", width=4)
+        draw.rectangle(box, fill="#FAF9F7", outline="#151515", width=2)
+        draw.line((x0 + 16, y0 + 12, x1 - 16, y0 + 12), fill="#C53A48", width=4)
     elif kind == "info":
-        rounded_panel(draw, (x0, y0, x1, y1), "#FFFFFF", "#B8CBE3", 18, 3)
+        rounded_panel(draw, box, "#FFFFFF", "#B8CBE3", 18, 3)
         draw.rectangle((x0, y0, x0 + 10, y1), fill="#2869C7")
     elif kind == "pop":
-        rounded_panel(draw, (x0, y0, x1, y1), "#FFFDF7", "#7546D8", 30, 4)
-        draw.ellipse((x1 - 32, y0 + 10, x1 - 12, y0 + 30), fill="#E8C84D")
+        rounded_panel(draw, box, "#FFFDF7", "#7546D8", 30, 4)
+        draw.ellipse((x1 - 32, y0 + 8, x1 - 12, y0 + 28), fill="#E8C84D")
     else:
-        draw.rectangle((x0, y0, x1, y1), fill="#12151A", outline="#FFB86B", width=2)
-        draw.line((x0 + 14, y0 + 14, x0 + 90, y0 + 14), fill="#FFB86B", width=3)
+        draw.rectangle(box, fill="#12151A", outline="#FFB86B", width=2)
+        draw.line((x0 + 14, y0 + 12, x0 + 90, y0 + 12), fill="#FFB86B", width=3)
 
+
+def draw_text_layout(draw, box, layout, style):
+    x0, y0, x1, y1 = box
+    pad = layout["pad"]
     text_color = style["text"]
     muted_color = style["muted"]
-    if kind == "luxury":
-        text_color = "#FFF8E8"
-        muted_color = "#C7BDA8"
+    accent = style["accent"]
 
-    cursor_y = y0 + inner_padding
-    for line in title_lines:
-        line = fit_text(draw, line, title_font, text_width_limit)
-        draw.text(
-            (x0 + inner_padding, cursor_y),
-            line, font=title_font, fill=text_color,
-        )
-        cursor_y += title_line_height
+    y = y0 + pad
+    for line in layout["title_lines"]:
+        draw.text((x0 + pad, y), line, font=layout["title_font"], fill=text_color)
+        y += layout["title_lh"]
 
-    if body_lines:
-        cursor_y += gap
-        for line in body_lines:
-            line = fit_text(draw, line, body_font, text_width_limit)
-            draw.text(
-                (x0 + inner_padding, cursor_y),
-                line, font=body_font, fill=muted_color,
+    if layout["body_items"]:
+        y += layout["gap"]
+        body_lh = layout["body_lh"]
+        for item in layout["body_items"]:
+            bullet_y = y + body_lh // 2 - 5
+            draw.rounded_rectangle(
+                (x0 + pad, bullet_y, x0 + pad + 9, bullet_y + 9),
+                radius=2, fill=accent,
             )
-            cursor_y += body_line_height
-
-    return canvas
+            for line in item:
+                draw.text(
+                    (x0 + pad + layout["bullet_indent"], y),
+                    line, font=layout["body_font"], fill=muted_color,
+                )
+                y += body_lh
+            y += layout["item_gap"]
 
 
 def render_ad_card(
@@ -1020,69 +1198,91 @@ def render_ad_card(
     total_cards=1,
 ):
     style = STYLE_OPTIONS.get(style_id, STYLE_OPTIONS["minimal"])
+    kind = style["kind"]
+    W, H = CARD_W, CARD_H
 
     with Image.open(io.BytesIO(normalize_image_bytes(image_bytes, 1800, 93))) as source:
-        product_image = source.convert("RGB").copy()
+        photo = source.convert("RGB").copy()
 
-    width, height = 1080, 1350
-    kind = style["kind"]
+    layout = build_text_layout(text, position) if (text and position != "none") else None
+    if layout is None:
+        position = "none"
+    panel_box, (px, py, side) = compute_geometry(position, layout)
 
-    product_image = ImageOps.fit(
-        product_image,
-        (width, height),
-        method=Image.Resampling.LANCZOS,
-        centering=(0.5, 0.5),
+    # 1. Фон: размытая копия самой фотографии, подкрашенная цветами стиля.
+    background = ImageOps.fit(
+        photo, (W, H), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
+    ).filter(ImageFilter.GaussianBlur(38))
+    tint = Image.new("RGB", (W, H))
+    draw_gradient(tint, (0, 0, W, H), style["top"], style["bottom"])
+    canvas = Image.blend(background, tint, 0.3)
+
+    # 2. Фото: квадрат целиком (без обрезки), с мягкими краями.
+    product = ImageOps.fit(
+        photo, (side, side), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
+    ).filter(ImageFilter.UnsharpMask(radius=1.6, percent=70, threshold=3))
+    mask = feather_mask(
+        side,
+        fade_left=px > 0,
+        fade_right=px + side < W,
+        fade_top=py > 0,
+        fade_bottom=py + side < H,
     )
-    canvas = product_image.convert("RGB")
+    canvas.paste(product, (px, py), mask)
 
+    # 3. Декор стиля.
     overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
 
     if kind == "luxury":
-        od.rectangle((20, 20, width - 21, height - 21), outline=(215, 181, 109, 230), width=3)
-        od.rectangle((34, 34, width - 35, height - 35), outline=(215, 181, 109, 100), width=1)
+        od.rectangle((20, 20, W - 21, H - 21), outline=(215, 181, 109, 230), width=3)
+        od.rectangle((34, 34, W - 35, H - 35), outline=(215, 181, 109, 100), width=1)
     elif kind == "tech":
-        for gx in range(35, width, 90):
-            od.line((gx, 0, gx, height), fill=(101, 214, 255, 38), width=1)
-        for gy in range(35, height, 90):
-            od.line((0, gy, width, gy), fill=(101, 214, 255, 32), width=1)
+        for gx in range(35, W, 90):
+            od.line((gx, 0, gx, H), fill=(101, 214, 255, 38), width=1)
+        for gy in range(35, H, 90):
+            od.line((0, gy, W, gy), fill=(101, 214, 255, 32), width=1)
         od.line((35, 35, 180, 35), fill=(101, 214, 255, 220), width=4)
     elif kind == "eco":
-        od.ellipse((width - 235, 35, width - 45, 225), outline=(164, 185, 153, 180), width=3)
+        od.ellipse((W - 235, 35, W - 45, 225), outline=(164, 185, 153, 180), width=3)
     elif kind == "pop":
         od.ellipse((25, 30, 130, 135), fill=(232, 200, 77, 190))
-        od.ellipse((width - 145, 45, width - 50, 140), fill=(164, 138, 240, 170))
+        od.ellipse((W - 145, 45, W - 50, 140), fill=(164, 138, 240, 170))
     elif kind == "fashion":
-        od.line((45, 42, width - 45, 42), fill=(255, 255, 255, 220), width=2)
-        od.line((45, height - 42, width - 45, height - 42), fill=(255, 255, 255, 220), width=2)
+        od.line((45, 42, W - 45, 42), fill=(255, 255, 255, 220), width=2)
+        od.line((45, H - 42, W - 45, H - 42), fill=(255, 255, 255, 220), width=2)
     elif kind == "market":
         od.polygon([(0, 0), (230, 0), (0, 170)], fill=(255, 226, 165, 200))
     elif kind == "info":
-        od.rounded_rectangle((25, 25, width - 25, height - 25), radius=28, outline=(184, 203, 227, 210), width=3)
+        od.rounded_rectangle((25, 25, W - 25, H - 25), radius=28, outline=(184, 203, 227, 210), width=3)
     elif kind == "cinematic":
         for y in range(250):
             alpha = int(100 * (1 - y / 250))
-            od.line((0, y, width, y), fill=(0, 0, 0, alpha))
-            od.line((0, height - 1 - y, width, height - 1 - y), fill=(0, 0, 0, alpha))
+            od.line((0, y, W, y), fill=(0, 0, 0, alpha))
+            od.line((0, H - 1 - y, W, H - 1 - y), fill=(0, 0, 0, alpha))
 
     canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay).convert("RGB")
 
-    if text and position != "none":
-        canvas = add_text_block(canvas, text, style, position, card_index, total_cards)
-
+    # 4. Текстовая плашка — строго в своей зоне, товар не перекрывает.
     draw = ImageDraw.Draw(canvas)
+    if layout and panel_box:
+        draw_panel(draw, kind, panel_box, style)
+        draw_text_layout(draw, panel_box, layout, style)
+
+    # 5. Номер карточки — в углу, где нет плашки.
     index_font = load_font(17, True)
     index_text = f"{card_index}/{total_cards}"
     iw = text_width(draw, index_text, index_font)
+    badge_top = 36 if position == "bottom" else H - 52
     draw.rounded_rectangle(
-        (width - iw - 42, height - 52, width - 20, height - 20),
+        (W - iw - 42, badge_top, W - 20, badge_top + 32),
         radius=12,
         fill=style["panel"],
         outline=style["border"],
         width=1,
     )
     draw.text(
-        (width - iw - 31, height - 47),
+        (W - iw - 31, badge_top + 5),
         index_text, font=index_font, fill=style["text"],
     )
 
@@ -1155,7 +1355,8 @@ def process_photo(chat_id, file_ids, prompt, style_id, cards):
             f"🎨 Начинаю комплект: {card_count} карточек.\n"
             f"Стиль: {style['emoji']} {style['name']}\n"
             f"Фотографий-референсов: {len(file_ids)}\n\n"
-            "За весь комплект списывается 1 кредит. Это может занять несколько минут.",
+            "За весь комплект списывается 1 кредит. Это может занять несколько минут. "
+            "Карточки буду присылать по мере готовности.",
         )
 
         image_bytes_list = []
@@ -1168,16 +1369,36 @@ def process_photo(chat_id, file_ids, prompt, style_id, cards):
             )
             image_bytes_list.append(data)
 
-        prepared = []
+        photo_total = len(image_bytes_list)
 
         for index, card_data in enumerate(cards, start=1):
             role = CARD_ROLES[min(index - 1, len(CARD_ROLES) - 1)]
+
+            # Какое фото — главное для этой карточки.
+            primary = safe_int(card_data.get("photo_index"), (index - 1) % photo_total)
+            if not 0 <= primary < photo_total:
+                primary = (index - 1) % photo_total
+            ordered = [image_bytes_list[primary]] + [
+                data for i, data in enumerate(image_bytes_list) if i != primary
+            ]
+
+            if photo_total > 1:
+                angle_note = (
+                    "Reference image 1 is the PRIMARY view for this card: keep the "
+                    "product at the same viewing angle and orientation as reference "
+                    "image 1. Use the other references only to keep details accurate. "
+                )
+            else:
+                angle_note = (
+                    "Keep the product at the same viewing angle as the reference. "
+                )
 
             style_prompt = (
                 f"Create product photo {index} of {card_count}. "
                 f"Visual style: {style['name']}. "
                 f"Direction: {style['description']}. "
                 f"Composition role: {role}. "
+                + angle_note +
                 "All references show the same product. Preserve its exact identity, "
                 "geometry, proportions, color, materials, labels, logos, buttons, "
                 "camera count and details. Do not add text, prices, discounts, "
@@ -1186,7 +1407,7 @@ def process_photo(chat_id, file_ids, prompt, style_id, cards):
                 "User's visual instructions: " + prompt
             )
 
-            generated = generate_product_image(image_bytes_list, style_prompt)
+            generated = generate_product_image(ordered, style_prompt)
             final_card = render_ad_card(
                 generated.getvalue(),
                 card_data.get("text", ""),
@@ -1195,18 +1416,15 @@ def process_photo(chat_id, file_ids, prompt, style_id, cards):
                 index,
                 card_count,
             )
-            prepared.append(final_card)
-
-            send_message(chat_id, f"🧩 Подготовлена карточка {index}/{card_count}…")
-
-        for index, card in enumerate(prepared, start=1):
             send_generated_photo(
                 chat_id,
-                card,
+                final_card,
                 caption=f"✅ Карточка {index}/{card_count} • {style['name']}",
                 filename=f"tovarpix_{style_id}_{index}.jpg",
             )
             sent_count += 1
+            with state_lock:
+                runtime_stats["cards_rendered"] += 1
 
         with state_lock:
             runtime_stats["images_succeeded"] += 1
@@ -1249,7 +1467,7 @@ def process_photo(chat_id, file_ids, prompt, style_id, cards):
 
         if sent_count:
             message = (
-                f"⚠️ Не удалось отправить весь комплект: доставлено {sent_count} "
+                f"⚠️ Не удалось закончить комплект: доставлено {sent_count} "
                 f"из {card_count} карточек. Кредит не возвращён, потому что часть "
                 "результатов уже отправлена. Если нужна помощь, сообщи администратору."
             )
@@ -1300,6 +1518,8 @@ def help_text():
         "5. Укажи количество карточек от 1 до 7.\n"
         "6. Напиши пожелания к обработке фотографии.\n"
         "7. Для каждой карточки отдельно задай текст и его расположение.\n\n"
+        "Если загружено несколько ракурсов, каждая карточка делается по своему фото: "
+        "1-я по первому, 2-я по второму и так далее.\n"
         "Текст наносится программно, поэтому нейросеть не рисует русские надписи.\n"
         "Один комплект из 1–7 карточек стоит 1 кредит."
     )
@@ -1410,9 +1630,10 @@ def handle_command_or_text(chat_id, message, text):
         return
 
     if command == "/cancel" or text == "❌ Отмена":
-        with state_lock:
-            pending_photos.pop(chat_id, None)
-            pending_jobs.pop(chat_id, None)
+        try:
+            clear_session(chat_id)
+        except Exception:
+            logger.exception("Could not clear session")
         send_message(chat_id, "Ожидание отменено. Можешь начать заново.", main_keyboard())
         return
 
@@ -1427,6 +1648,7 @@ def handle_command_or_text(chat_id, message, text):
             "Пример текста карточки:\n"
             "Беспроводные наушники\n"
             "Компактный дизайн и удобный кейс\n\n"
+            "Первая строка — заголовок, каждая следующая — отдельная характеристика.\n"
             "Указывай только характеристики, которые действительно известны.",
             main_keyboard(),
         )
@@ -1463,8 +1685,19 @@ def handle_command_or_text(chat_id, message, text):
 
 
 # ============================================================
-# CALLBACKS — ИСПРАВЛЕН ПЕРЕХОД МЕЖДУ КАРТОЧКАМИ
+# CALLBACKS (кнопки) — состояние хранится в PostgreSQL
 # ============================================================
+
+def card_text_prompt(card_index, card_count, photo_count):
+    note = ""
+    if photo_count > 1:
+        note = f"\n📷 Эта карточка будет сделана по фото №{(card_index % photo_count) + 1}."
+    return (
+        f"✍️ Напиши текст для карточки {card_index + 1}/{card_count}.{note}\n\n"
+        "Первая строка — заголовок. Каждая следующая строка — отдельная характеристика.\n"
+        "Если текст не нужен, напиши «Без текста»."
+    )
+
 
 def handle_callback_query(callback):
     callback_id = callback.get("id")
@@ -1475,10 +1708,6 @@ def handle_callback_query(callback):
         answer_callback_query(callback_id, "Не удалось определить чат")
         return
 
-    with state_lock:
-        file_ids = list(pending_photos.get(chat_id, []))
-        job = pending_jobs.get(chat_id)
-
     if data == "photos:help":
         answer_callback_query(callback_id)
         send_message(
@@ -1486,174 +1715,282 @@ def handle_callback_query(callback):
             "📷 Лучше прислать фотографии одного товара:\n\n"
             "• Вид спереди.\n• Вид сзади.\n• Вид сбоку.\n"
             "• Крупный план логотипа или важных деталей.\n\n"
+            "Каждая карточка комплекта будет сделана по своему фото. "
             "Если есть только одно фото, продолжай с ним.",
         )
         return
 
-    if data == "photos:done":
-        if not file_ids:
-            answer_callback_query(callback_id, "Сначала отправь фото")
-            return
+    toast = None
+    messages = []
+    start_args = None
 
-        with state_lock:
-            pending_jobs[chat_id] = {
-                "stage": "style",
-                "style_id": None,
-                "card_count": None,
-                "prompt": "",
-                "cards": [],
-                "card_index": 0,
-            }
+    with session_edit(chat_id) as s:
+        photos = list(s.get("photos", []))
+        job = s.get("job")
+        stage = job.get("stage") if job else None
 
-        answer_callback_query(callback_id, f"Фотографий: {len(file_ids)}")
-        send_message(
-            chat_id,
-            f"✅ Собрано фотографий: {len(file_ids)}.\n\nТеперь выбери стиль.",
-            style_keyboard(),
-        )
-        return
+        if data == "photos:done":
+            if not photos:
+                toast = "Сначала отправь фото"
+            elif job and stage not in ("photos", "style"):
+                toast = "Эта кнопка сейчас недоступна"
+            else:
+                s["job"] = new_job("style")
+                toast = f"Фотографий: {len(photos)}"
+                messages.append((
+                    f"✅ Собрано фотографий: {len(photos)}.\n\nТеперь выбери стиль.",
+                    style_keyboard(),
+                ))
 
-    if not file_ids or not job:
-        answer_callback_query(callback_id, "Сначала отправь фото товара")
-        send_message(chat_id, "Сначала отправь фотографию товара.", main_keyboard())
-        return
+        elif not photos or not job:
+            toast = "Сначала отправь фото товара"
+            messages.append(("Сначала отправь фотографию товара.", main_keyboard()))
 
-    if data.startswith("style:"):
-        style_id = data.split(":", 1)[1]
-        if style_id not in STYLE_OPTIONS:
-            answer_callback_query(callback_id, "Неизвестный стиль")
-            return
+        elif data.startswith("style:"):
+            style_id = data.split(":", 1)[1]
+            if style_id not in STYLE_OPTIONS:
+                toast = "Неизвестный стиль"
+            elif stage not in ("style", "count"):
+                toast = "Эта кнопка сейчас недоступна"
+            else:
+                job["style_id"] = style_id
+                job["stage"] = "count"
+                style = STYLE_OPTIONS[style_id]
+                toast = f"Выбран стиль: {style['name']}"
+                messages.append((
+                    f"Выбран стиль: {style['emoji']} {style['name']}\n\n"
+                    "Сколько карточек сделать? Весь комплект стоит 1 кредит.",
+                    count_keyboard(),
+                ))
 
-        with state_lock:
-            job["style_id"] = style_id
-            job["stage"] = "count"
-            pending_jobs[chat_id] = job
+        elif data.startswith("count:"):
+            count = safe_int(data.split(":", 1)[1], 0)
+            if not 1 <= count <= 7:
+                toast = "Можно выбрать от 1 до 7"
+            elif not job.get("style_id"):
+                toast = "Сначала выбери стиль"
+                messages.append(("Сначала выбери стиль.", style_keyboard()))
+            elif stage not in ("count", "prompt"):
+                toast = "Эта кнопка сейчас недоступна"
+            else:
+                job["card_count"] = count
+                job["stage"] = "prompt"
+                job["cards"] = []
+                job["card_index"] = 0
+                toast = f"Карточек: {count}"
+                messages.append((
+                    f"📦 Комплект: {count} карточек.\n"
+                    f"🎨 Стиль: {STYLE_OPTIONS[job['style_id']]['name']}\n"
+                    f"📷 Фотографий: {len(photos)}\n"
+                    "💳 Стоимость: 1 кредит.\n\n"
+                    "Теперь напиши пожелания к обработке фотографий.\n"
+                    "Например: белая студия, мягкая тень, товар строго по центру.\n\n"
+                    "Если пожеланий нет, напиши «Стандартно».",
+                    main_keyboard(),
+                ))
 
-        answer_callback_query(
-            callback_id,
-            f"Выбран стиль: {STYLE_OPTIONS[style_id]['name']}",
-        )
-        send_message(
-            chat_id,
-            f"Выбран стиль: {STYLE_OPTIONS[style_id]['emoji']} "
-            f"{STYLE_OPTIONS[style_id]['name']}\n\n"
-            "Сколько карточек сделать? Весь комплект стоит 1 кредит.",
-            count_keyboard(),
-        )
-        return
+        elif data.startswith("position:"):
+            position = data.split(":", 1)[1]
+            if position not in ("top", "bottom", "left", "right", "none"):
+                toast = "Неизвестное положение"
+            elif stage != "card_position":
+                toast = "Эта кнопка сейчас недоступна"
+            else:
+                index = safe_int(job.get("card_index"), 0)
+                cards = job.get("cards", [])
+                card_count = safe_int(job.get("card_count"), 0)
 
-    if data.startswith("count:"):
-        count = safe_int(data.split(":", 1)[1], 0)
-        if not 1 <= count <= 7:
-            answer_callback_query(callback_id, "Можно выбрать от 1 до 7")
-            return
+                if index < 0 or index >= len(cards):
+                    toast = "Карточка не найдена. Нажми «❌ Отмена» и начни заново"
+                else:
+                    cards[index]["position"] = position
+                    next_index = index + 1
 
-        with state_lock:
-            if not job.get("style_id"):
-                answer_callback_query(callback_id, "Сначала выбери стиль")
-                send_message(chat_id, "Сначала выбери стиль.", style_keyboard())
-                return
+                    if next_index < card_count:
+                        job["card_index"] = next_index
+                        job["stage"] = "card_text"
+                        toast = "Положение сохранено"
+                        messages.append((
+                            f"✅ Карточка {index + 1}/{card_count}: положение сохранено.\n\n"
+                            + card_text_prompt(next_index, card_count, len(photos)),
+                            None,
+                        ))
+                    else:
+                        with state_lock:
+                            is_busy = chat_id in busy_chats
+                        if is_busy:
+                            toast = "Предыдущий комплект ещё обрабатывается"
+                        else:
+                            start_args = (
+                                list(photos),
+                                job.get("prompt", ""),
+                                job.get("style_id"),
+                                [dict(card) for card in cards],
+                            )
+                            s.clear()
+                            toast = "Настройки сохранены"
+                            messages.append((
+                                "✅ Настройки всех карточек готовы!\n\n"
+                                "Начинаю обработку фотографий. Не отправляй новые фото, "
+                                "пока комплект не закончится.",
+                                None,
+                            ))
+        else:
+            toast = "Кнопка устарела"
 
-            job["card_count"] = count
-            job["stage"] = "prompt"
-            job["cards"] = []
-            job["card_index"] = 0
-            pending_jobs[chat_id] = job
-
-        answer_callback_query(callback_id, f"Карточек: {count}")
-        send_message(
-            chat_id,
-            f"📦 Комплект: {count} карточек.\n"
-            f"🎨 Стиль: {STYLE_OPTIONS[job['style_id']]['name']}\n"
-            f"📷 Фотографий: {len(file_ids)}\n"
-            "💳 Стоимость: 1 кредит.\n\n"
-            "Теперь напиши пожелания к обработке фотографий.\n"
-            "Например: белая студия, мягкая тень, товар строго по центру.\n\n"
-            "Если пожеланий нет, напиши «Стандартно».",
-            main_keyboard(),
-        )
-        return
-
-    if data.startswith("position:"):
-        position = data.split(":", 1)[1]
-        if position not in ("top", "bottom", "left", "right", "none"):
-            answer_callback_query(callback_id, "Неизвестное положение")
-            return
-
-        with state_lock:
-            job = pending_jobs.get(chat_id)
-
-            if not job or job.get("stage") != "card_position":
-                answer_callback_query(callback_id, "Эта кнопка сейчас недоступна")
-                return
-
-            index = safe_int(job.get("card_index"), 0)
-            cards = job.get("cards", [])
-            card_count = safe_int(job.get("card_count"), 0)
-
-            if index < 0 or index >= len(cards):
-                answer_callback_query(callback_id, "Карточка не найдена")
-                return
-
-            # Сохраняем положение текста текущей карточки.
-            cards[index]["position"] = position
-
-            # Переходим к следующей карточке.
-            next_index = index + 1
-            job["card_index"] = next_index
-
-            if next_index < card_count:
-                # ГЛАВНОЕ ИСПРАВЛЕНИЕ:
-                # сначала просим текст следующей карточки,
-                # а уже после текста показываем кнопки положения.
-                job["stage"] = "card_text"
-                pending_jobs[chat_id] = job
-
-                answer_callback_query(callback_id, "Положение сохранено")
-                send_message(
-                    chat_id,
-                    f"✅ Карточка {index + 1}/{card_count}: положение сохранено.\n\n"
-                    f"✍️ Теперь напиши текст для карточки {next_index + 1}/{card_count}.\n"
-                    "Можно написать заголовок и характеристики с новой строки.\n\n"
-                    "Если текст не нужен, напиши «Без текста»."
-                )
-                return
-
-            # Все карточки настроены — запускаем обработку.
-            completed_cards = [dict(card) for card in cards]
-            prompt = job.get("prompt", "")
-            style_id = job.get("style_id")
-            file_ids = list(pending_photos.get(chat_id, []))
-
-            pending_jobs.pop(chat_id, None)
-            pending_photos.pop(chat_id, None)
-
-        answer_callback_query(callback_id, "Настройки сохранены")
-        send_message(
-            chat_id,
-            "✅ Настройки всех карточек готовы!\n\n"
-            "Начинаю обработку фотографий. Не отправляй новые фото, пока комплект не закончится.",
-        )
-        start_processing(
-            chat_id,
-            file_ids,
-            prompt,
-            style_id,
-            completed_cards,
-        )
-        return
-
-    answer_callback_query(callback_id, "Кнопка устарела")
+    answer_callback_query(callback_id, toast)
+    for text, markup in messages:
+        send_message(chat_id, text, markup)
+    if start_args:
+        start_processing(chat_id, *start_args)
 
 
 # ============================================================
 # TELEGRAM UPDATE HANDLER
 # ============================================================
 
-def handle_update(update):
-    with state_lock:
-        runtime_stats["updates"] += 1
+def extract_chat_id(update):
+    try:
+        if update.get("message"):
+            return update["message"].get("chat", {}).get("id")
+        if update.get("callback_query"):
+            return update["callback_query"].get("message", {}).get("chat", {}).get("id")
+        if update.get("pre_checkout_query"):
+            return update["pre_checkout_query"].get("from", {}).get("id")
+    except Exception:
+        pass
+    return None
 
+
+def handle_photo_message(chat_id, message):
+    file_id = message["photo"][-1]["file_id"]
+    reply = None
+    count = 0
+
+    with state_lock:
+        is_busy = chat_id in busy_chats
+
+    with session_edit(chat_id) as s:
+        job = s.get("job")
+        photos = list(s.get("photos", []))
+
+        if is_busy:
+            reply = "⏳ Дождись завершения предыдущей обработки."
+        elif job and job.get("stage") not in (None, "photos"):
+            reply = "Ты уже начал настройку комплекта. Нажми «❌ Отмена», чтобы начать заново."
+        elif len(photos) >= MAX_REFERENCE_PHOTOS:
+            reply = f"Можно использовать максимум {MAX_REFERENCE_PHOTOS} фотографий."
+        else:
+            photos.append(file_id)
+            s["photos"] = photos
+            s["job"] = new_job("photos")
+            count = len(photos)
+
+    if reply:
+        send_message(chat_id, reply)
+        return
+
+    send_message(
+        chat_id,
+        f"📸 Фотография {count}/{MAX_REFERENCE_PHOTOS} получена.\n\n"
+        "Можешь прислать другие ракурсы того же товара. Когда закончишь, нажми кнопку ниже.",
+        photo_collection_keyboard(),
+    )
+
+
+def handle_plain_text(chat_id, message, text):
+    action = None
+    card_number = 0
+    card_count = 0
+    photo_count = 0
+    stage = None
+
+    with session_edit(chat_id) as s:
+        photos = list(s.get("photos", []))
+        job = s.get("job")
+        photo_count = len(photos)
+
+        if photos and job:
+            stage = job.get("stage")
+
+            if stage == "prompt" and job.get("style_id") and job.get("card_count"):
+                job["prompt"] = "" if text.lower() in (
+                    "стандартно", "без пожеланий", "по умолчанию"
+                ) else text
+                job["stage"] = "card_text"
+                job["card_index"] = 0
+                job["cards"] = []
+                card_number = 1
+                card_count = safe_int(job["card_count"], 1)
+                action = "ask_first_text"
+
+            elif stage == "card_text":
+                index = safe_int(job.get("card_index"), 0)
+                card_count = safe_int(job.get("card_count"), 0)
+                card_text = clean_overlay_text(text)
+                if card_text.lower().strip(" .!") in ("без текста", "нет", "пропустить"):
+                    card_text = ""
+
+                cards = job.setdefault("cards", [])
+                entry = {
+                    "text": card_text,
+                    "position": "bottom",
+                    "photo_index": index % max(1, len(photos)),
+                }
+                if index < len(cards):
+                    cards[index] = entry
+                else:
+                    cards.append(entry)
+
+                job["stage"] = "card_position"
+                card_number = index + 1
+                action = "ask_position"
+
+            else:
+                action = "remind"
+
+    if action == "ask_first_text":
+        send_message(
+            chat_id,
+            f"Карточка 1/{card_count}.\n\n"
+            + card_text_prompt(0, card_count, photo_count),
+        )
+        return
+
+    if action == "ask_position":
+        send_message(
+            chat_id,
+            f"📍 Текст для карточки {card_number}/{card_count} принят.\n\n"
+            "Теперь выбери, где разместить текст.",
+            position_keyboard(),
+        )
+        return
+
+    if action == "remind":
+        if stage == "photos":
+            send_message(
+                chat_id,
+                "Сначала закончи загрузку фотографий кнопкой ниже.",
+                photo_collection_keyboard(),
+            )
+        elif stage == "style":
+            send_message(chat_id, "Сначала выбери стиль.", style_keyboard())
+        elif stage == "count":
+            send_message(chat_id, "Выбери количество от 1 до 7.", count_keyboard())
+        elif stage == "card_position":
+            send_message(
+                chat_id,
+                "Сначала выбери положение текста кнопками выше.",
+                position_keyboard(),
+            )
+        else:
+            handle_command_or_text(chat_id, message, text)
+        return
+
+    handle_command_or_text(chat_id, message, text)
+
+
+def process_update(update):
     if update.get("pre_checkout_query"):
         handle_pre_checkout(update["pre_checkout_query"])
         return
@@ -1681,147 +2018,37 @@ def handle_update(update):
     text = (message.get("text") or "").strip()
 
     if message.get("photo"):
-        with state_lock:
-            if chat_id in busy_chats:
-                send_message(chat_id, "⏳ Дождись завершения предыдущей обработки.")
-                return
-
-            job = pending_jobs.get(chat_id)
-            if job and job.get("stage") not in (None, "photos"):
-                send_message(
-                    chat_id,
-                    "Ты уже начал настройку комплекта. Нажми «❌ Отмена», чтобы начать заново.",
-                )
-                return
-
-            file_id = message["photo"][-1]["file_id"]
-            pending_photos.setdefault(chat_id, [])
-
-            if len(pending_photos[chat_id]) >= MAX_REFERENCE_PHOTOS:
-                send_message(
-                    chat_id,
-                    f"Можно использовать максимум {MAX_REFERENCE_PHOTOS} фотографий.",
-                )
-                return
-
-            pending_photos[chat_id].append(file_id)
-            count = len(pending_photos[chat_id])
-            pending_jobs[chat_id] = {
-                "stage": "photos",
-                "style_id": None,
-                "card_count": None,
-                "prompt": "",
-                "cards": [],
-                "card_index": 0,
-            }
-
-        send_message(
-            chat_id,
-            f"📸 Фотография {count}/{MAX_REFERENCE_PHOTOS} получена.\n\n"
-            "Можешь прислать другие ракурсы того же товара. Когда закончишь, нажми кнопку ниже.",
-            photo_collection_keyboard(),
-        )
+        handle_photo_message(chat_id, message)
         return
 
-    if text and not text.startswith("/"):
-        with state_lock:
-            file_ids = list(pending_photos.get(chat_id, []))
-            job = pending_jobs.get(chat_id, {})
-
-            stage = job.get("stage")
-            ready_for_prompt = bool(
-                file_ids and stage == "prompt"
-                and job.get("style_id") and job.get("card_count")
-            )
-
-            if ready_for_prompt:
-                job["prompt"] = "" if text.lower() in (
-                    "стандартно", "без пожеланий", "по умолчанию"
-                ) else text
-                job["stage"] = "card_text"
-                job["card_index"] = 0
-                job["cards"] = []
-                pending_jobs[chat_id] = job
-                card_number = 1
-                card_count = job["card_count"]
-            else:
-                card_number = 0
-                card_count = 0
-
-            # Получаем текст для очередной карточки.
-            # Индекс card_index указывает на карточку, которую сейчас настраиваем.
-            if stage == "card_text" and file_ids:
-                card_number = safe_int(job.get("card_index"), 0) + 1
-                card_count = safe_int(job.get("card_count"), 0)
-                card_text = clean_overlay_text(text)
-
-                if card_text.lower() in ("без текста", "нет", "пропустить"):
-                    card_text = ""
-
-                job["cards"].append({
-                    "text": card_text,
-                    "position": "bottom",
-                })
-                job["stage"] = "card_position"
-                pending_jobs[chat_id] = job
-                ask_position = True
-            else:
-                ask_position = False
-
-        if ready_for_prompt:
-            send_message(
-                chat_id,
-                f"✍️ Карточка 1/{card_count}.\n\n"
-                "Напиши текст, который нужно нанести на первую карточку.\n"
-                "Можно написать заголовок и характеристики с новой строки.\n\n"
-                "Если текст не нужен, напиши «Без текста».",
-            )
-            return
-
-        if ask_position:
-            send_message(
-                chat_id,
-                f"📍 Текст для карточки {card_number}/{card_count} принят.\n\n"
-                "Теперь выбери, где разместить текст.",
-                position_keyboard(),
-            )
-            return
-
-        if file_ids:
-            stage = job.get("stage", "photos")
-
-            if stage == "photos":
-                send_message(
-                    chat_id,
-                    "Сначала закончи загрузку фотографий кнопкой ниже.",
-                    photo_collection_keyboard(),
-                )
-            elif stage == "style":
-                send_message(chat_id, "Сначала выбери стиль.", style_keyboard())
-            elif stage == "count":
-                send_message(chat_id, "Выбери количество от 1 до 7.", count_keyboard())
-            elif stage == "card_position":
-                send_message(
-                    chat_id,
-                    "Сначала выбери положение текста кнопками выше.",
-                    position_keyboard(),
-                )
-            elif stage == "card_text":
-                send_message(
-                    chat_id,
-                    "Напиши текст для текущей карточки. Если текст не нужен, напиши «Без текста».",
-                )
-            else:
-                handle_command_or_text(chat_id, message, text)
-        else:
-            handle_command_or_text(chat_id, message, text)
-        return
-
-    if text.startswith("/"):
+    # Кнопки нижнего меню и команды — ВСЕГДА команды, а не текст карточки.
+    if text in MENU_TEXTS or text.startswith("/"):
         handle_command_or_text(chat_id, message, text)
         return
 
+    if text:
+        handle_plain_text(chat_id, message, text)
+        return
+
     send_message(chat_id, "Отправь фотографию товара, чтобы начать.", main_keyboard())
+
+
+def handle_update(update):
+    with state_lock:
+        runtime_stats["updates"] += 1
+
+    try:
+        process_update(update)
+    except Exception as exc:
+        logger.exception("Update handling failed")
+        note_runtime_error(exc)
+        chat_id = extract_chat_id(update)
+        if chat_id:
+            send_message(
+                chat_id,
+                "⚠️ Что-то пошло не так. Нажми «❌ Отмена» и начни заново.",
+                main_keyboard(),
+            )
 
 
 # ============================================================
