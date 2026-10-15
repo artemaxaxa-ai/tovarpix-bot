@@ -54,7 +54,22 @@ PACKAGE_CREDITS = 5
 PACKAGE_STARS = 5
 MAX_REFERENCE_PHOTOS = 6
 MAX_PROMPT_LENGTH = 1500
-MAX_OVERLAY_TEXT = 400
+MAX_OVERLAY_TEXT = 700
+# Настройки Magic Hour можно менять в Render (Environment) без правки кода.
+MH_ASPECT = os.environ.get("MH_ASPECT", "4:5").strip() or "4:5"
+MH_RESOLUTION = os.environ.get("MH_RESOLUTION", "1k").strip() or "1k"
+MH_FALLBACK = ("1:1", "640px")
+
+
+def aspect_ratio_value(text):
+    try:
+        a, b = str(text).split(":")
+        return float(a) / float(b)
+    except Exception:
+        return 1.0
+
+
+PORTRAIT_MODE = aspect_ratio_value(MH_ASPECT) < 0.95
 APP_STARTED_AT = time.time()
 
 if not TOKEN:
@@ -817,7 +832,10 @@ Use them as references for one product, never as separate products.
 Preserve product identity: geometry, proportions, colors, materials,
 buttons, ports, labels, branding, logos, stickers, camera count,
 lens positions, accessories and visible details. Never redesign,
-duplicate, replace or invent physical parts. Do not create a collage.
+duplicate, replace or invent physical parts. Do not add ports, vents,
+slots, buttons, grilles or any detail that is not visible on the
+references. Keep the real thickness, depth and proportions of the
+product. Do not create a collage.
 
 Create a realistic commercial product photo shoot with believable
 lighting, contact shadows and coherent reflections. Keep the product
@@ -827,9 +845,44 @@ Do not add text, prices, discounts, specifications, watermarks or
 invented badges inside the generated photograph. Avoid floating objects,
 halos, fake reflections, distorted geometry and excessive glow.
 
-Keep the product centered with generous empty space around it, so a
-text panel can be placed next to the photo without covering the product.
+Compose the product with generous clean empty space around it.
 """
+
+
+def _call_magic_hour(paths, prompt, aspect, resolution, temp_dir):
+    result = magic_client.v1.ai_image_editor.generate(
+        name="TovarPix product photo",
+        assets={"image_file_paths": paths},
+        style={"prompt": prompt},
+        model="qwen-image-2.1",
+        aspect_ratio=aspect,
+        resolution=resolution,
+        image_count=1,
+        wait_for_completion=True,
+        download_outputs=True,
+        download_directory=temp_dir,
+    )
+
+    if getattr(result, "status", None) != "complete":
+        error = getattr(result, "error", None)
+        if error:
+            raise RuntimeError(
+                f"Magic Hour: {getattr(error, 'code', 'error')}: "
+                f"{getattr(error, 'message', str(error))}"
+            )
+        raise RuntimeError(
+            f"Генерация завершилась со статусом: "
+            f"{getattr(result, 'status', 'unknown')}"
+        )
+
+    output_paths = getattr(result, "downloaded_paths", None)
+    if not output_paths:
+        raise RuntimeError("Magic Hour не вернул готовое изображение")
+
+    output_path = Path(str(output_paths[0]))
+    if not output_path.is_file():
+        raise RuntimeError("Не найден готовый файл изображения")
+    return output_path.read_bytes()
 
 
 def generate_product_image(image_bytes_list, user_prompt):
@@ -839,6 +892,10 @@ def generate_product_image(image_bytes_list, user_prompt):
     normalized_images = [normalize_image_bytes(data) for data in image_bytes_list]
     prompt = BASE_PROMPT + "\nVISUAL STYLE:\n" + clean_user_text(user_prompt)
 
+    attempts = [(MH_ASPECT, MH_RESOLUTION)]
+    if attempts[0] != MH_FALLBACK:
+        attempts.append(MH_FALLBACK)
+
     with tempfile.TemporaryDirectory() as temp_dir:
         paths = []
         for index, data in enumerate(normalized_images, start=1):
@@ -846,42 +903,29 @@ def generate_product_image(image_bytes_list, user_prompt):
             path.write_bytes(data)
             paths.append(str(path))
 
-        result = magic_client.v1.ai_image_editor.generate(
-            name="TovarPix product photo",
-            assets={"image_file_paths": paths},
-            style={"prompt": prompt},
-            model="qwen-image-2.1",
-            aspect_ratio="1:1",
-            resolution="640px",
-            image_count=1,
-            wait_for_completion=True,
-            download_outputs=True,
-            download_directory=temp_dir,
-        )
-
-        if getattr(result, "status", None) != "complete":
-            error = getattr(result, "error", None)
-            if error:
-                raise RuntimeError(
-                    f"Magic Hour: {getattr(error, 'code', 'error')}: "
-                    f"{getattr(error, 'message', str(error))}"
+        raw = None
+        for attempt_index, (aspect, resolution) in enumerate(attempts):
+            try:
+                raw = _call_magic_hour(paths, prompt, aspect, resolution, temp_dir)
+                break
+            except Exception as exc:
+                message = str(exc).lower()
+                param_problem = any(
+                    key in message for key in (
+                        "aspect", "resolution", "invalid", "unsupported",
+                        "validation", "422", "not supported",
+                    )
                 )
-            raise RuntimeError(
-                f"Генерация завершилась со статусом: "
-                f"{getattr(result, 'status', 'unknown')}"
-            )
+                if attempt_index < len(attempts) - 1 and param_problem:
+                    logger.warning(
+                        "Magic Hour rejected %s/%s (%s); retrying with %s/%s",
+                        aspect, resolution, type(exc).__name__,
+                        attempts[-1][0], attempts[-1][1],
+                    )
+                    continue
+                raise
 
-        output_paths = getattr(result, "downloaded_paths", None)
-        if not output_paths:
-            raise RuntimeError("Magic Hour не вернул готовое изображение")
-
-        output_path = Path(str(output_paths[0]))
-        if not output_path.is_file():
-            raise RuntimeError("Не найден готовый файл изображения")
-
-        return io.BytesIO(
-            normalize_image_bytes(output_path.read_bytes(), max_side=3000, quality=94)
-        )
+        return io.BytesIO(normalize_image_bytes(raw, max_side=3000, quality=94))
 
 
 # ============================================================
@@ -1010,8 +1054,8 @@ def build_text_layout(text, position):
 
     measure = ImageDraw.Draw(Image.new("RGB", (10, 10)))
 
-    title = " ".join(lines_raw[0].split())[:100]
-    title_sizes = (40, 36, 32, 28) if side else (52, 48, 44, 40, 36)
+    title = " ".join(lines_raw[0].split())[:140]
+    title_sizes = (40, 36, 32, 28) if side else (46, 42, 38, 34)
     title_font = None
     title_lines = []
     title_size = title_sizes[-1]
@@ -1027,9 +1071,9 @@ def build_text_layout(text, position):
     bullet_indent = 24
     body_items = []
     for item in lines_raw[1:7]:
-        item = " ".join(item.split())[:110]
+        item = " ".join(item.split())[:260]
         item_lines, _ = wrap_lines(
-            measure, item, body_font, inner_w - bullet_indent, 2
+            measure, item, body_font, inner_w - bullet_indent, 3
         )
         if item_lines:
             body_items.append(item_lines)
@@ -1127,6 +1171,33 @@ def feather_mask(side, fade_left, fade_right, fade_top, fade_bottom):
     return mask
 
 
+def rgb_to_hex(rgb):
+    return "#%02X%02X%02X" % tuple(int(c) for c in rgb[:3])
+
+
+def edge_gradient_background(photo, style):
+    """Спокойный фон без размытых пятен: цвета берутся с верхнего и нижнего края фото."""
+    w, h = photo.size
+    strip = max(1, h // 20)
+    top = photo.crop((0, 0, w, strip)).resize((1, 1), Image.BOX).getpixel((0, 0))
+    bottom = photo.crop((0, h - strip, w, h)).resize((1, 1), Image.BOX).getpixel((0, 0))
+    base = Image.new("RGB", (CARD_W, CARD_H))
+    draw_gradient(base, (0, 0, CARD_W, CARD_H), rgb_to_hex(top), rgb_to_hex(bottom))
+    tint = Image.new("RGB", (CARD_W, CARD_H))
+    draw_gradient(tint, (0, 0, CARD_W, CARD_H), style["top"], style["bottom"])
+    return Image.blend(base, tint, 0.25)
+
+
+def paste_panel_shadow(canvas, box, radius=24):
+    x0, y0, x1, y1 = box
+    shadow = Image.new("L", canvas.size, 0)
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        (x0 + 4, y0 + 10, x1 + 4, y1 + 10), radius=radius, fill=110
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(14))
+    canvas.paste((0, 0, 0), (0, 0, canvas.width, canvas.height), shadow)
+
+
 def draw_panel(draw, kind, box, style):
     x0, y0, x1, y1 = box
     if kind == "minimal":
@@ -1209,26 +1280,28 @@ def render_ad_card(
         position = "none"
     panel_box, (px, py, side) = compute_geometry(position, layout)
 
-    # 1. Фон: размытая копия самой фотографии, подкрашенная цветами стиля.
-    background = ImageOps.fit(
-        photo, (W, H), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
-    ).filter(ImageFilter.GaussianBlur(38))
-    tint = Image.new("RGB", (W, H))
-    draw_gradient(tint, (0, 0, W, H), style["top"], style["bottom"])
-    canvas = Image.blend(background, tint, 0.3)
+    portrait = (photo.width / max(1, photo.height)) <= 0.9
 
-    # 2. Фото: квадрат целиком (без обрезки), с мягкими краями.
-    product = ImageOps.fit(
-        photo, (side, side), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
-    ).filter(ImageFilter.UnsharpMask(radius=1.6, percent=70, threshold=3))
-    mask = feather_mask(
-        side,
-        fade_left=px > 0,
-        fade_right=px + side < W,
-        fade_top=py > 0,
-        fade_bottom=py + side < H,
-    )
-    canvas.paste(product, (px, py), mask)
+    if portrait:
+        # Портретное фото (4:5): оно занимает всю карточку, а место под текст
+        # мы заранее попросили оставить пустым в запросе к нейросети.
+        canvas = ImageOps.fit(
+            photo, (W, H), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
+        ).filter(ImageFilter.UnsharpMask(radius=1.4, percent=60, threshold=3))
+    else:
+        # Квадратное фото: вписываем целиком с мягкими краями на спокойном фоне.
+        canvas = edge_gradient_background(photo, style)
+        product = ImageOps.fit(
+            photo, (side, side), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5)
+        ).filter(ImageFilter.UnsharpMask(radius=1.6, percent=70, threshold=3))
+        mask = feather_mask(
+            side,
+            fade_left=px > 0,
+            fade_right=px + side < W,
+            fade_top=py > 0,
+            fade_bottom=py + side < H,
+        )
+        canvas.paste(product, (px, py), mask)
 
     # 3. Декор стиля.
     overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
@@ -1266,6 +1339,8 @@ def render_ad_card(
     # 4. Текстовая плашка — строго в своей зоне, товар не перекрывает.
     draw = ImageDraw.Draw(canvas)
     if layout and panel_box:
+        paste_panel_shadow(canvas, panel_box)
+        draw = ImageDraw.Draw(canvas)
         draw_panel(draw, kind, panel_box, style)
         draw_text_layout(draw, panel_box, layout, style)
 
@@ -1318,6 +1393,33 @@ def send_generated_photo(
 # ============================================================
 # IMAGE SET PROCESSING — ONE CREDIT FOR THE WHOLE SET
 # ============================================================
+
+def space_instruction(text, position):
+    """Просим нейросеть оставить чистое место под текстовую плашку."""
+    if not PORTRAIT_MODE or not text or position == "none":
+        return ""
+    layout = build_text_layout(text, position)
+    if not layout:
+        return ""
+    if position in ("top", "bottom"):
+        pct = (layout["h"] + CARD_MARGIN * 2) / CARD_H * 100
+    else:
+        pct = (layout["w"] + CARD_MARGIN * 2) / CARD_W * 100
+    pct = int(min(45, round(pct + 4)))
+    rest = 100 - pct
+    where = {
+        "top": ("top", "lower", "centered horizontally"),
+        "bottom": ("bottom", "upper", "centered horizontally"),
+        "left": ("left", "right", "centered vertically"),
+        "right": ("right", "left", "centered vertically"),
+    }[position]
+    return (
+        f"COMPOSITION: keep the {where[0]} {pct}% of the frame as plain empty "
+        f"background with no product and no objects, because a text panel will "
+        f"be placed there. Place the whole product inside the remaining "
+        f"{where[1]} {rest}% of the frame, {where[2]}. "
+    )
+
 
 def process_photo(chat_id, file_ids, prompt, style_id, cards):
     credit_type = None
@@ -1403,7 +1505,10 @@ def process_photo(chat_id, file_ids, prompt, style_id, cards):
                 "geometry, proportions, color, materials, labels, logos, buttons, "
                 "camera count and details. Do not add text, prices, discounts, "
                 "badges or invented specifications inside the image. "
+                "Do not add ports, vents, slots or buttons that are not visible "
+                "on the references. "
                 "Change the background, environment, lighting and composition only. "
+                + space_instruction(card_data.get("text", ""), card_data.get("position", "bottom")) +
                 "User's visual instructions: " + prompt
             )
 
