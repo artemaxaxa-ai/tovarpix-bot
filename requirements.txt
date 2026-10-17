@@ -1,8 +1,5 @@
-pyTelegramBotAPI
-Flask
-gunicorn
-requests
-huggingface_hub
-Pillow
-magic_hour
-psycopg[binary]
+Flask>=3.0
+gunicorn>=22.0
+requests>=2.31
+Pillow>=10.3
+psycopg2-binary>=2.9
