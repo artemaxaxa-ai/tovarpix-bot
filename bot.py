@@ -11,6 +11,7 @@ import os
 import io
 import json
 import time
+import re
 import random
 import zlib
 import base64
@@ -46,10 +47,8 @@ MAGIC_KEY = env("MAGIC_HOUR_API_KEY", "MAGICHOUR_API_KEY", "MAGIC_HOUR_KEY", "MA
 GEMINI_KEY = env("GEMINI_API_KEY", "GEMINI_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY", "GENAI_API_KEY")
 DATABASE_URL = env("DATABASE_URL")
 BASE_URL = env("WEBHOOK_URL", "RENDER_EXTERNAL_URL", "BASE_URL").rstrip("/")
-ADMIN_ID = env("ADMIN_ID")
+ADMIN_SET = {x.strip() for x in env("ADMIN_IDS", "ADMIN_ID").replace(";", ",").split(",") if x.strip()}
 
-GEMINI_TEXT_MODEL = env("GEMINI_TEXT_MODEL", default="gemini-2.5-flash")
-GEMINI_IMAGE_MODEL = env("GEMINI_IMAGE_MODEL", default="gemini-2.5-flash-image")
 RETOUCH_ENABLED = env("RETOUCH_ENABLED", default="1") != "0"  # 0 = выключить чистку пыли
 
 # 1 звезда = 1 карточка. Пакеты: сколько звезд платит человек (кредитов столько же).
@@ -796,6 +795,8 @@ def gemini_call(model, parts, gen_config=None):
         body["generationConfig"] = gen_config
     r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=120)
     if not r.ok:
+        if r.status_code == 404:
+            _bad_models.add(model)
         raise RuntimeError("Gemini %s (%s): %s" % (r.status_code, model, r.text[:200].replace("\n", " ")))
     return r.json()
 
@@ -808,8 +809,72 @@ def to_b64_jpeg(img, maxside=1024):
     return base64.b64encode(buf.getvalue()).decode()
 
 
-TEXT_MODELS = [GEMINI_TEXT_MODEL, "gemini-2.0-flash", "gemini-flash-latest"]
-IMAGE_MODELS = [GEMINI_IMAGE_MODEL, "gemini-2.5-flash-image-preview"]
+_models_cache = {"t": 0, "items": []}
+_bad_models = set()
+_NOT_TEXT = ("image", "tts", "audio", "live", "embedding", "robotics", "computer", "native",
+             "vision", "imagen", "veo", "gemma", "learnlm", "aqa", "thinking")
+
+
+def list_models():
+    """Спрашиваем у Google, какие модели сейчас доступны этому ключу."""
+    if _models_cache["items"] and time.time() - _models_cache["t"] < 3600:
+        return _models_cache["items"]
+    items, token = [], None
+    for _ in range(3):
+        params = {"key": GEMINI_KEY, "pageSize": 200}
+        if token:
+            params["pageToken"] = token
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models", params=params, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        for m in j.get("models", []):
+            if "generateContent" in (m.get("supportedGenerationMethods") or []):
+                items.append(m.get("name", "").replace("models/", ""))
+        token = j.get("nextPageToken")
+        if not token:
+            break
+    _models_cache.update(t=time.time(), items=items)
+    return items
+
+
+def model_rank(name):
+    nums = re.findall(r"\d+(?:\.\d+)?", name)
+    ver = float(nums[0]) if nums else 0.0
+    return (ver, "preview" not in name and "exp" not in name, "lite" not in name)
+
+
+def _dedupe(seq):
+    out = []
+    for x in seq:
+        if x and x not in out and x not in _bad_models:
+            out.append(x)
+    return out
+
+
+def text_models():
+    out = [env("GEMINI_TEXT_MODEL")]
+    try:
+        found = [n for n in list_models() if n.startswith("gemini") and "flash" in n
+                 and not any(b in n for b in _NOT_TEXT)]
+        found.sort(key=model_rank, reverse=True)
+        out += found[:3]
+    except Exception:
+        log.warning("list_models failed: %s", traceback.format_exc()[-200:])
+    out += ["gemini-3.8-flash", "gemini-flash-latest"]
+    return _dedupe(out)
+
+
+def image_models():
+    out = [env("GEMINI_IMAGE_MODEL")]
+    try:
+        found = [n for n in list_models() if n.startswith("gemini") and "image" in n
+                 and not any(b in n for b in _NOT_TEXT if b != "image")]
+        found.sort(key=model_rank, reverse=True)
+        out += found[:2]
+    except Exception:
+        log.warning("list_models failed: %s", traceback.format_exc()[-200:])
+    out += ["gemini-2.5-flash-image"]
+    return _dedupe(out)
 
 
 def gemini_text(src_img):
@@ -826,7 +891,7 @@ def gemini_text(src_img):
         "материалы, бренды и гарантию упоминай, только если это написано на самом товаре."
     )
     last_err = None
-    for model in TEXT_MODELS:
+    for model in text_models():
         try:
             j = gemini_call(model,
                             [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": to_b64_jpeg(src_img)}}],
@@ -886,7 +951,7 @@ def retouch(cutout):
             "Return the same photo, only cleaner."
         )
         data, last = None, None
-        for model in IMAGE_MODELS:
+        for model in image_models():
             try:
                 j = gemini_call(model,
                                 [{"text": prompt}, {"inline_data": {"mime_type": "image/png",
@@ -968,16 +1033,13 @@ def diag_text():
     lines.append("• Gemini ключ: %s" % ("есть" if GEMINI_KEY else "НЕТ (проверь название переменной в Render)"))
     if GEMINI_KEY:
         try:
-            j = gemini_call(TEXT_MODELS[0], [{"text": "Ответь одним словом: ок"}], {"maxOutputTokens": 20})
-            lines.append("• Gemini текст (%s): работает" % TEXT_MODELS[0])
+            tm, im = text_models(), image_models()
+            lines.append("• Модели для текста: %s" % ", ".join(tm[:3]))
+            lines.append("• Модели для чистки фото: %s" % ", ".join(im[:2]))
+            gemini_call(tm[0], [{"text": "Ответь одним словом: ок"}], {"maxOutputTokens": 20})
+            lines.append("• Gemini текст (%s): работает ✅" % tm[0])
         except Exception as e:
             lines.append("• Gemini текст: ОШИБКА — %s" % str(e)[:220])
-        try:
-            r = requests.get("https://generativelanguage.googleapis.com/v1beta/models/%s" % IMAGE_MODELS[0],
-                             params={"key": GEMINI_KEY}, timeout=30)
-            lines.append("• Gemini чистка фото (%s): %s" % (IMAGE_MODELS[0], "модель доступна" if r.ok else "ОШИБКА %s" % r.status_code))
-        except Exception as e:
-            lines.append("• Gemini чистка фото: ОШИБКА — %s" % str(e)[:120])
     if MAGIC_KEY:
         try:
             r = requests.get("%s/image-projects/00000000-0000-0000-0000-000000000000" % MH, headers=mh_headers(), timeout=30)
@@ -1146,7 +1208,7 @@ def on_message(msg):
         return
     if cmd == "/give":
         parts = text.split()
-        if ADMIN_ID and str(uid) == ADMIN_ID and len(parts) == 3:
+        if str(uid) in ADMIN_SET and len(parts) == 3:
             try:
                 add_credits(int(parts[1]), int(parts[2]))
                 show(chat_id, "Готово: пользователю %s добавлено %s ⭐" % (parts[1], parts[2]))
