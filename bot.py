@@ -11,6 +11,8 @@ import os
 import io
 import json
 import time
+import random
+import zlib
 import base64
 import logging
 import threading
@@ -22,7 +24,7 @@ from functools import lru_cache
 import requests
 import psycopg2
 from flask import Flask, request
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps, ImageChops
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps, ImageChops, ImageStat
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tovarpix")
@@ -40,8 +42,8 @@ def env(*names, default=""):
 
 
 BOT_TOKEN = env("BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "TOKEN")
-MAGIC_KEY = env("MAGIC_HOUR_API_KEY", "MAGICHOUR_API_KEY", "MAGIC_HOUR_KEY", "MAGIC_API_KEY")
-GEMINI_KEY = env("GEMINI_API_KEY", "GOOGLE_API_KEY")
+MAGIC_KEY = env("MAGIC_HOUR_API_KEY", "MAGICHOUR_API_KEY", "MAGIC_HOUR_KEY", "MAGIC_API_KEY", "MAGICHOUR_KEY", "MAGIC_HOUR_TOKEN")
+GEMINI_KEY = env("GEMINI_API_KEY", "GEMINI_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_API_KEY", "GENAI_API_KEY")
 DATABASE_URL = env("DATABASE_URL")
 BASE_URL = env("WEBHOOK_URL", "RENDER_EXTERNAL_URL", "BASE_URL").rstrip("/")
 ADMIN_ID = env("ADMIN_ID")
@@ -190,7 +192,8 @@ def save_session(uid, data):
 
 
 # ============================================================
-# 4. СТИЛИ: 10 готовых шаблонов (фон, свет и места текста всегда одни и те же)
+# 4. СТИЛИ: 10 готовых сцен (стена + стол). Фон и свет у каждого стиля всегда одни и те же,
+#    текст всегда в одних и тех же местах — меняется только сам текст.
 # ============================================================
 def rgb(h):
     h = h.lstrip("#")
@@ -198,70 +201,82 @@ def rgb(h):
 
 
 # Боксы задаются долями холста: (x, y, ширина, высота)
+# wall = цвета стены (верх, низ); table = цвета стола (дальний край, ближний край)
+# tex = текстура стола; edge = цвет блика на дальнем крае стола; reflect = отражение товара в столе
 STYLES = {
     "minimal": dict(
-        name="⚪ Минимализм", top="#F8F8F6", bottom="#E7E7E3", ambient="#F2F2EE", shadow=0.30,
+        name="⚪ Минимализм", wall=("#F7F7F5", "#E3E3DF"), table=("#FFFFFF", "#ECECE8"), tex="noise",
+        edge="#FFFFFF", reflect=False, ambient="#F2F2EE", shadow=0.42,
         title_c="#161616", sub_c="#5C5C5C", bul_c="#2A2A2A", accent="#161616", upper=False,
         align="left", bullets="dots", chip_text="#FFFFFF",
         prod=(0.10, 0.30, 0.80, 0.54), title=(0.08, 0.06, 0.84, 0.15), sub=(0.08, 0.215, 0.84, 0.07),
-        bul=(0.08, 0.855, 0.84, 0.12)),
+        bul=(0.08, 0.865, 0.84, 0.115)),
     "luxury": dict(
-        name="🖤 Люкс", top="#0C0C0E", bottom="#1E1A13", ambient="#2A2418", shadow=0.55,
+        name="🖤 Люкс", wall=("#0B0B0D", "#221C12"), table=("#2A2830", "#0E0E10"), tex="marble",
+        edge="#C9A24B", reflect=True, ambient="#2A2418", shadow=0.75,
         title_c="#E8C77A", sub_c="#CFC6B0", bul_c="#E6DFCC", accent="#C9A24B", upper=True,
         align="center", bullets="dots", chip_text="#101010",
         prod=(0.12, 0.31, 0.76, 0.50), title=(0.10, 0.08, 0.80, 0.14), sub=(0.10, 0.235, 0.80, 0.06),
-        bul=(0.10, 0.84, 0.80, 0.11)),
+        bul=(0.10, 0.855, 0.80, 0.11)),
     "cozy": dict(
-        name="🧸 Уют", top="#F6EBDA", bottom="#EBD6B8", ambient="#E8D2B2", shadow=0.28,
-        title_c="#5A3E2B", sub_c="#7B5A43", bul_c="#5A3E2B", accent="#B8774A", upper=False,
+        name="🧸 Уют", wall=("#F6EBDA", "#EAD5B6"), table=("#E2C79E", "#CDA876"), tex="wood",
+        edge="#F3E2C4", reflect=False, ambient="#E8D2B2", shadow=0.45,
+        title_c="#4A2F1C", sub_c="#6B4A33", bul_c="#5A3E2B", accent="#B8774A", upper=False,
         align="left", bullets="dots", chip_text="#FFFFFF",
-        prod=(0.10, 0.20, 0.80, 0.50), title=(0.08, 0.725, 0.84, 0.12), sub=(0.08, 0.85, 0.84, 0.06),
+        prod=(0.10, 0.20, 0.80, 0.50), title=(0.08, 0.745, 0.84, 0.12), sub=(0.08, 0.865, 0.84, 0.06),
         bul=(0.08, 0.055, 0.84, 0.12)),
     "market": dict(
-        name="🛒 Маркет", top="#FFFFFF", bottom="#EEF1FA", ambient="#F4F6FC", shadow=0.28,
+        name="🛒 Маркет", wall=("#FFFFFF", "#EDF0F9"), table=("#F4F6FC", "#DDE2F0"), tex="noise",
+        edge="#FFFFFF", reflect=False, ambient="#F4F6FC", shadow=0.40,
         title_c="#FFFFFF", sub_c="#FFE3E8", bul_c="#FFFFFF", accent="#FF3355", upper=True,
         align="center", bullets="chips", chip_text="#FFFFFF",
         prod=(0.10, 0.26, 0.80, 0.57), title=(0.05, 0.03, 0.90, 0.12), sub=(0.05, 0.15, 0.90, 0.05),
         bul=(0.08, 0.855, 0.84, 0.12)),
     "tech": dict(
-        name="⚡ Техно", top="#08101E", bottom="#14213D", ambient="#16294A", shadow=0.55,
+        name="⚡ Техно", wall=("#070D19", "#13203A"), table=("#1B2740", "#080D18"), tex="noise",
+        edge="#22D3EE", reflect=True, ambient="#16294A", shadow=0.75,
         title_c="#FFFFFF", sub_c="#7DD3E8", bul_c="#DDEBF2", accent="#22D3EE", upper=True,
         align="left", bullets="dots", chip_text="#06202A",
         prod=(0.10, 0.30, 0.80, 0.54), title=(0.08, 0.07, 0.84, 0.14), sub=(0.08, 0.225, 0.84, 0.06),
-        bul=(0.08, 0.855, 0.84, 0.12)),
+        bul=(0.08, 0.865, 0.84, 0.115)),
     "eco": dict(
-        name="🌿 Эко", top="#EAF4E3", bottom="#CFE6C4", ambient="#DDEED2", shadow=0.28,
-        title_c="#24462A", sub_c="#41704A", bul_c="#24462A", accent="#4E9A58", upper=False,
+        name="🌿 Эко", wall=("#EAF4E3", "#D2E8C7"), table=("#E6D9B4", "#CDBB8E"), tex="wood",
+        edge="#F4EBCF", reflect=False, ambient="#DDEED2", shadow=0.42,
+        title_c="#1F4025", sub_c="#3C6A45", bul_c="#24462A", accent="#4E9A58", upper=False,
         align="center", bullets="dots", chip_text="#FFFFFF",
-        prod=(0.12, 0.18, 0.76, 0.54), title=(0.08, 0.74, 0.84, 0.12), sub=(0.08, 0.865, 0.84, 0.06),
+        prod=(0.12, 0.18, 0.76, 0.54), title=(0.08, 0.755, 0.84, 0.12), sub=(0.08, 0.875, 0.84, 0.06),
         bul=(0.08, 0.05, 0.84, 0.12)),
     "fashion": dict(
-        name="👗 Фэшн", top="#F1EAE7", bottom="#E8DDD8", ambient="#E8D3CC", shadow=0.30,
+        name="👗 Фэшн", wall=("#F1EAE7", "#E6DAD5"), table=("#E9DAD3", "#D5C0B7"), tex="noise",
+        edge="#FFFFFF", reflect=False, ambient="#E8D3CC", shadow=0.42,
         title_c="#1F1F1F", sub_c="#6B5A55", bul_c="#2B2B2B", accent="#2B2B2B", upper=True,
         align="left", bullets="dots", chip_text="#FFFFFF",
-        prod=(0.20, 0.20, 0.64, 0.50), title=(0.08, 0.76, 0.84, 0.12), sub=(0.08, 0.885, 0.84, 0.05),
+        prod=(0.20, 0.20, 0.64, 0.50), title=(0.08, 0.77, 0.84, 0.12), sub=(0.08, 0.895, 0.84, 0.05),
         bul=(0.08, 0.05, 0.50, 0.12)),
     "info": dict(
-        name="📊 Инфографика", top="#F4F6FA", bottom="#E6EBF3", ambient="#F4F6FA", shadow=0.22,
+        name="📊 Инфографика", wall=("#F4F6FA", "#E3E9F3"), table=("#FFFFFF", "#EBEFF6"), tex="noise",
+        edge="#FFFFFF", reflect=False, ambient="#F4F6FA", shadow=0.36,
         title_c="#0F2A5C", sub_c="#52627F", bul_c="#FFFFFF", accent="#2563EB", upper=False,
         align="left", bullets="chips", chip_text="#FFFFFF",
         prod=(0.12, 0.27, 0.76, 0.50), title=(0.07, 0.05, 0.86, 0.13), sub=(0.07, 0.185, 0.86, 0.06),
-        bul=(0.07, 0.80, 0.86, 0.17)),
+        bul=(0.07, 0.805, 0.86, 0.17)),
     "pop": dict(
-        name="🎉 Поп", top="#FFD60A", bottom="#FFC800", ambient="#FFE066", shadow=0.35,
+        name="🎉 Поп", wall=("#FFD60A", "#FFC800"), table=("#FF4FA8", "#E01E86"), tex="noise",
+        edge="#111111", reflect=False, ambient="#FFE066", shadow=0.50, dot="#111111",
         title_c="#111111", sub_c="#111111", bul_c="#111111", accent="#FF2E93", upper=True,
         align="center", bullets="dots", chip_text="#FFFFFF",
         prod=(0.10, 0.28, 0.80, 0.55), title=(0.06, 0.04, 0.88, 0.15), sub=(0.06, 0.195, 0.88, 0.06),
-        bul=(0.08, 0.86, 0.84, 0.11)),
+        bul=(0.08, 0.865, 0.84, 0.11)),
     "cinematic": dict(
-        name="🎬 Кино", top="#05080B", bottom="#0E2A33", ambient="#123640", shadow=0.60,
+        name="🎬 Кино", wall=("#04070A", "#0D2A33"), table=("#183640", "#05100F"), tex="noise",
+        edge="#5EC4D6", reflect=True, ambient="#123640", shadow=0.80,
         title_c="#FFFFFF", sub_c="#9FC9D3", bul_c="#D8E8EC", accent="#5EC4D6", upper=True,
         align="center", bullets="dots", chip_text="#04161B",
-        prod=(0.12, 0.18, 0.76, 0.54), title=(0.08, 0.74, 0.84, 0.10), sub=(0.08, 0.845, 0.84, 0.05),
+        prod=(0.12, 0.18, 0.76, 0.54), title=(0.08, 0.76, 0.84, 0.10), sub=(0.08, 0.86, 0.84, 0.05),
         bul=(0.10, 0.075, 0.80, 0.10)),
 }
 STYLE_ORDER = ["minimal", "luxury", "cozy", "market", "tech", "eco", "fashion", "info", "pop", "cinematic"]
-NO_TEXT_BOX = (0.09, 0.10, 0.82, 0.80)  # где стоит товар, если текста нет
+NO_TEXT_BOX = (0.09, 0.10, 0.82, 0.78)  # где стоит товар, если текста нет
 
 
 # ---------- шрифты ----------
@@ -324,8 +339,9 @@ def get_font(size, weight=700):
     return f
 
 
-# ---------- рисование фона ----------
+# ---------- рисование сцены: стена, стол, тени ----------
 def gradient(W, H, top, bottom):
+    H = max(1, int(H))
     mask = Image.linear_gradient("L").resize((W, H))
     return Image.composite(Image.new("RGB", (W, H), rgb(bottom)), Image.new("RGB", (W, H), rgb(top)), mask)
 
@@ -351,109 +367,175 @@ def vignette(img, strength=0.7):
     return img
 
 
-def decor(key, img, W, H, pb, has_text):
+def table_texture(tb, key, st):
+    """Текстура стола: дерево, мрамор или лёгкое зерно."""
+    w, h = tb.size
+    rnd = random.Random(zlib.crc32(key.encode()))
+    tex = st["tex"]
+    if tex == "wood":
+        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        y = 0
+        while y < h:
+            th = rnd.randint(2, 6)
+            dark = rnd.random() < 0.6
+            a = rnd.randint(8, 30)
+            d.rectangle([0, y, w, y + th], fill=((60, 35, 15, a) if dark else (255, 240, 215, a)))
+            y += th + rnd.randint(0, 4)
+        for _ in range(7):  # длинные волокна
+            yy = rnd.randint(0, h)
+            d.line([0, yy, w, yy + rnd.randint(-12, 12)], fill=(70, 40, 20, rnd.randint(30, 60)), width=1)
+        tb = Image.alpha_composite(tb.convert("RGBA"), layer).convert("RGB")
+    elif tex == "marble":
+        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        for _ in range(9):
+            x, y = rnd.randint(0, w), rnd.randint(0, h)
+            pts = [(x, y)]
+            for _ in range(26):
+                x += rnd.randint(-int(w * .05), int(w * .07))
+                y += rnd.randint(-int(h * .05), int(h * .06))
+                pts.append((x, y))
+            col = (201, 162, 75, rnd.randint(25, 60)) if rnd.random() < 0.5 else (255, 255, 255, rnd.randint(14, 34))
+            d.line(pts, fill=col, width=rnd.randint(1, 3))
+        layer = layer.filter(ImageFilter.GaussianBlur(1.2))
+        tb = Image.alpha_composite(tb.convert("RGBA"), layer).convert("RGB")
+    noise = Image.effect_noise((w, h), 26).convert("RGB")
+    return Image.blend(tb, noise, 0.035)
+
+
+def draw_wall(key, img, W, H, pb, hz, has_text):
+    """Декор на стене (всё, что ниже линии стола, потом закроет стол)."""
     st = STYLES[key]
     acc = rgb(st["accent"])
     px0, py0, px1, py1 = pb
-    pcx, pcy = (px0 + px1) / 2, (py0 + py1) / 2
-    pw, ph = px1 - px0, py1 - py0
-
+    pcx = (px0 + px1) / 2
+    pw = px1 - px0
+    cy = py0 + (hz - py0) * 0.45
     if key == "minimal":
-        img = glow(img, pcx, pcy, pw * 0.62, ph * 0.62, (255, 255, 255), 0.9)
+        img = glow(img, pcx, cy, pw * 0.7, (hz - py0) * 0.8, (255, 255, 255), 0.95)
         if has_text:
             img = shapes(img, lambda d: d.rectangle([W * .08, H * .292, W * .17, H * .292 + 4], fill=acc + (255,)))
     elif key == "luxury":
-        img = glow(img, pcx, pcy, pw * 0.65, ph * 0.6, rgb("#5A4720"), 0.55)
-        g = acc
-
-        def f(d):
-            m = int(W * .035)
-            d.rectangle([m, m, W - m, H - m], outline=g + (255,), width=3)
-            m2 = int(W * .05)
-            d.rectangle([m2, m2, W - m2, H - m2], outline=g + (120,), width=1)
-            if has_text:
-                d.line([W * .42, H * .31, W * .58, H * .31], fill=g + (255,), width=2)
-        img = shapes(img, f)
+        img = glow(img, pcx, cy, pw * 0.7, (hz - py0) * 0.9, rgb("#6B5524"), 0.6)
     elif key == "cozy":
-        def f(d):
-            r = pw * 0.52
-            d.ellipse([pcx - r, pcy - r, pcx + r, pcy + r], fill=rgb("#E9D3B2") + (255,))
-            d.ellipse([W * .78, -H * .03, W * 1.0, H * .13], fill=rgb("#EFDDC0") + (255,))
-            d.ellipse([-W * .06, H * .60, W * .14, H * .74], fill=rgb("#EFDDC0") + (255,))
-        img = shapes(img, f)
+        r = pw * 0.5
+        img = shapes(img, lambda d: (
+            d.ellipse([pcx - r, cy - r, pcx + r, cy + r], fill=rgb("#EFDCBD") + (255,)),
+            d.ellipse([W * .78, -H * .03, W * 1.0, H * .13], fill=rgb("#EFDDC0") + (255,))))
     elif key == "market":
-        if has_text:
-            def f(d):
-                d.polygon([(0, 0), (W, 0), (W, H * .205), (0, H * .235)], fill=acc + (255,))
-                d.polygon([(0, H * .235), (W, H * .205), (W, H * .215), (0, H * .245)], fill=rgb("#FFB3C0") + (255,))
-            img = shapes(img, f)
-        img = glow(img, pcx, pcy, pw * 0.6, ph * 0.55, (255, 255, 255), 0.9)
-        img = shapes(img, lambda d: d.rectangle([0, H * .985, W, H], fill=acc + (255,)))
+        img = glow(img, pcx, cy, pw * 0.7, (hz - py0) * 0.8, (255, 255, 255), 0.95)
     elif key == "tech":
         def f(d):
             step = max(30, W // 10)
             for x in range(0, W, step):
-                d.line([x, 0, x, H], fill=acc + (22,), width=1)
-            for y in range(0, H, step):
+                d.line([x, 0, x, hz], fill=acc + (22,), width=1)
+            for y in range(0, int(hz), step):
                 d.line([0, y, W, y], fill=acc + (22,), width=1)
         img = shapes(img, f)
-        img = glow(img, pcx, pcy, pw * 0.62, ph * 0.5, rgb("#0E7490"), 0.6)
-
-        def g(d):
-            L, m = W * .07, W * .04
-            for (x, y, sx, sy) in [(m, m, 1, 1), (W - m, m, -1, 1), (m, H - m, 1, -1), (W - m, H - m, -1, -1)]:
-                d.line([x, y, x + sx * L, y], fill=acc + (255,), width=3)
-                d.line([x, y, x, y + sy * L], fill=acc + (255,), width=3)
-        img = shapes(img, g)
+        img = glow(img, pcx, cy, pw * 0.7, (hz - py0) * 0.8, rgb("#0E7490"), 0.65)
     elif key == "eco":
-        def f(d):
-            d.ellipse([W * .55, H * .02, W * 1.15, H * .45], fill=rgb("#D8ECCB") + (255,))
-            d.ellipse([-W * .25, H * .50, W * .35, H * .95], fill=rgb("#C4E1B6") + (255,))
-        img = shapes(img, f)
-        img = glow(img, pcx, pcy, pw * 0.6, ph * 0.55, (255, 255, 255), 0.85)
+        img = shapes(img, lambda d: (
+            d.ellipse([W * .55, H * .02, W * 1.15, H * .45], fill=rgb("#DDEFD1") + (255,)),
+            d.ellipse([-W * .25, H * .30, W * .35, H * .75], fill=rgb("#C9E4BB") + (255,))))
+        img = glow(img, pcx, cy, pw * 0.6, (hz - py0) * 0.7, (255, 255, 255), 0.85)
     elif key == "fashion":
-        e = W * 0.03
-
-        def f(d):
-            d.rectangle([px0 - e, py0 - e, px1 + e, py1 + e], fill=rgb("#DDBDB4") + (255,))
-            d.rectangle([px0 - e + W * .02, py0 - e + W * .02, px1 + e + W * .02, py1 + e + W * .02],
-                        outline=rgb("#2B2B2B") + (255,), width=2)
-        img = shapes(img, f)
-    elif key == "info":
         e = W * 0.04
-
-        def f(d):
-            d.rectangle([0, 0, W * .02, H], fill=acc + (255,))
-            d.rounded_rectangle([px0 - e + 6, py0 - e + 10, px1 + e + 6, py1 + e + 10], radius=int(W * .04),
-                                fill=(20, 40, 90, 28))
-            d.rounded_rectangle([px0 - e, py0 - e, px1 + e, py1 + e], radius=int(W * .04), fill=(255, 255, 255, 255))
-        img = shapes(img, f)
+        img = shapes(img, lambda d: d.rounded_rectangle(
+            [px0 - e, py0 - e * 1.5, px1 + e, hz + 10], radius=int(W * .25), fill=rgb("#DDBDB4") + (255,)))
+    elif key == "info":
+        img = glow(img, pcx, cy, pw * 0.7, (hz - py0) * 0.8, (255, 255, 255), 0.95)
     elif key == "pop":
-        r = min(pw, ph) * 0.5
+        r = min(pw, hz - py0) * 0.62
 
         def f(d):
             o = W * 0.014
-            d.ellipse([pcx - r + o, pcy - r + o, pcx + r + o, pcy + r + o], fill=(17, 17, 17, 255))
-            d.ellipse([pcx - r, pcy - r, pcx + r, pcy + r], fill=acc + (255,))
-            gap = W * 0.035
-            for i in range(5):
-                for j in range(4):
-                    x, y = W * .74 + i * gap, H * .015 + j * gap
-                    d.ellipse([x, y, x + 6, y + 6], fill=(17, 17, 17, 255))
-            d.rectangle([0, H * .975, W, H], fill=(17, 17, 17, 255))
+            d.ellipse([pcx - r + o, cy - r + o, pcx + r + o, cy + r + o], fill=(17, 17, 17, 255))
+            d.ellipse([pcx - r, cy - r, pcx + r, cy + r], fill=(255, 255, 255, 255))
         img = shapes(img, f)
     elif key == "cinematic":
-        img = glow(img, pcx, pcy, pw * 0.62, ph * 0.5, rgb("#13525F"), 0.6)
+        img = glow(img, pcx, cy, pw * 0.7, (hz - py0) * 0.8, rgb("#13525F"), 0.65)
         cone = Image.new("L", img.size, 0)
-        ImageDraw.Draw(cone).polygon([(W * .5, 0), (W * .18, H * .72), (W * .82, H * .72)], fill=60)
+        ImageDraw.Draw(cone).polygon([(W * .5, 0), (W * .16, hz), (W * .84, hz)], fill=70)
         cone = cone.filter(ImageFilter.GaussianBlur(W * 0.03))
         fade = Image.linear_gradient("L").transpose(Image.FLIP_TOP_BOTTOM).resize(img.size)
         cone = ImageChops.multiply(cone, fade)
         img.paste(Image.new("RGB", img.size, (210, 235, 240)), (0, 0), cone)
+    return img
+
+
+def draw_top(key, img, W, H, pb, hz, has_text):
+    """Рамки, ленты и прочее поверх стола, но под товаром."""
+    st = STYLES[key]
+    acc = rgb(st["accent"])
+    if key == "luxury":
+        def f(d):
+            m = int(W * .035)
+            d.rectangle([m, m, W - m, H - m], outline=acc + (255,), width=3)
+            m2 = int(W * .05)
+            d.rectangle([m2, m2, W - m2, H - m2], outline=acc + (120,), width=1)
+            if has_text:
+                d.line([W * .42, H * .31, W * .58, H * .31], fill=acc + (255,), width=2)
+        img = shapes(img, f)
+    elif key == "market":
+        def f(d):
+            if has_text:
+                d.polygon([(0, 0), (W, 0), (W, H * .205), (0, H * .235)], fill=acc + (255,))
+                d.polygon([(0, H * .235), (W, H * .205), (W, H * .215), (0, H * .245)], fill=rgb("#FFB3C0") + (255,))
+            d.rectangle([0, H * .985, W, H], fill=acc + (255,))
+        img = shapes(img, f)
+    elif key == "tech":
+        def f(d):
+            L, m = W * .07, W * .04
+            for (x, y, sx, sy) in [(m, m, 1, 1), (W - m, m, -1, 1), (m, H - m, 1, -1), (W - m, H - m, -1, -1)]:
+                d.line([x, y, x + sx * L, y], fill=acc + (255,), width=3)
+                d.line([x, y, x, y + sy * L], fill=acc + (255,), width=3)
+        img = shapes(img, f)
+    elif key == "info":
+        img = shapes(img, lambda d: d.rectangle([0, 0, W * .02, H], fill=acc + (255,)))
+    elif key == "pop":
+        img = shapes(img, lambda d: d.rectangle([0, H * .975, W, H], fill=(17, 17, 17, 255)))
+    elif key == "cinematic":
         img = vignette(img, 0.7)
         img = shapes(img, lambda d: (d.rectangle([0, 0, W, H * .045], fill=(0, 0, 0, 255)),
                                      d.rectangle([0, H * .955, W, H], fill=(0, 0, 0, 255))))
     return img
+
+
+# ---------- подготовка товара: пыль, царапины, свет ----------
+def despeckle(rgb_img, thr=12, dark=105):
+    """Убирает светлые точки пыли и тонкие царапины на тёмных поверхностях (текст и логотипы не трогает)."""
+    L = rgb_img.convert("L")
+    med = L.filter(ImageFilter.MedianFilter(5))
+    local = L.filter(ImageFilter.GaussianBlur(10))
+    speck = ImageChops.subtract(L, med).point(lambda v: 255 if v > thr else 0)
+    dk = local.point(lambda v: 255 if v < dark else 0)
+    m = ImageChops.multiply(speck, dk).filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.GaussianBlur(1))
+    rep = rgb_img.filter(ImageFilter.MedianFilter(7))
+    return Image.composite(rep, rgb_img, m)
+
+
+def clean_product(cut):
+    """Обрезает по товару, чистит пыль (2 прохода) и подтягивает экспозицию тёмных фото."""
+    cut = cut.convert("RGBA")
+    bb = cut.getchannel("A").point(lambda v: 255 if v > 16 else 0).getbbox()
+    if bb:
+        cut = cut.crop(bb)
+    cut.thumbnail((1600, 1600), Image.LANCZOS)
+    a = cut.getchannel("A")
+    rgb_img = cut.convert("RGB")
+    try:
+        rgb_img = despeckle(rgb_img, 12, 105)
+        rgb_img = despeckle(rgb_img, 9, 100)
+        mean = ImageStat.Stat(rgb_img.convert("L"), mask=a.point(lambda v: 255 if v > 128 else 0)).mean[0]
+        if mean < 105:  # тёмное фото — слегка поднимаем свет
+            g = 0.80 if mean < 75 else 0.88
+            rgb_img = rgb_img.point(lambda v: int(255 * ((v / 255.0) ** g)))
+    except Exception:
+        log.warning("clean_product skipped: %s", traceback.format_exc()[-300:])
+    out = rgb_img.convert("RGBA")
+    out.putalpha(a)
+    return out
 
 
 # ---------- текст ----------
@@ -555,7 +637,7 @@ def draw_text(img, key, W, H, text):
             yy = y
             for b, f, size in items:
                 r = size * 0.16
-                d.ellipse([x0, yy + size * 0.55 - r, x0 + 2 * r, yy + size * 0.55 + r], fill=rgb(st["accent"]))
+                d.ellipse([x0, yy + size * 0.55 - r, x0 + 2 * r, yy + size * 0.55 + r], fill=rgb(st.get("dot", st["accent"])))
                 d.text((x0 + size * 0.9, yy), b, font=f, fill=rgb(st["bul_c"]))
                 yy += size * 1.45
     return img
@@ -587,13 +669,9 @@ def compose(cutout, key, size_key, text, wm=False):
     frac = st["prod"] if has_text else NO_TEXT_BOX
     pb = (frac[0] * W, frac[1] * H, (frac[0] + frac[2]) * W, (frac[1] + frac[3]) * H)
 
-    img = gradient(W, H, st["top"], st["bottom"])
-    img = decor(key, img, W, H, pb, has_text)
-
-    # --- подготовка товара ---
+    # --- товар: размер и место ---
     cutout = cutout.convert("RGBA")
-    alpha = cutout.getchannel("A")
-    bbox = alpha.point(lambda v: 255 if v > 16 else 0).getbbox()
+    bbox = cutout.getchannel("A").point(lambda v: 255 if v > 16 else 0).getbbox()
     if bbox:
         cutout = cutout.crop(bbox)
     a = cutout.getchannel("A").filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(0.7))
@@ -602,23 +680,58 @@ def compose(cutout, key, size_key, text, wm=False):
     nw, nh = max(1, int(cutout.width * sc)), max(1, int(cutout.height * sc))
     rgb_img = cutout.convert("RGB").resize((nw, nh), Image.LANCZOS)
     a = a.resize((nw, nh), Image.LANCZOS)
-    # лёгкая подгонка под свет сцены (~5%)
+    # лёгкий студийный свет: сверху чуть светлее, снизу чуть темнее, плюс 5% цвета сцены
+    g = Image.linear_gradient("L").resize((nw, nh))
+    rgb_img = Image.composite(Image.blend(rgb_img, Image.new("RGB", (nw, nh), (0, 0, 0)), 0.12), rgb_img, g)
+    rgb_img = Image.composite(rgb_img, Image.blend(rgb_img, Image.new("RGB", (nw, nh), (255, 255, 255)), 0.06), g)
     rgb_img = Image.blend(rgb_img, Image.new("RGB", (nw, nh), rgb(st["ambient"])), 0.05)
     prod = rgb_img.convert("RGBA")
     prod.putalpha(a)
-
     x = int(pb[0] + (bw - nw) / 2)
     y = int(pb[1] + (bh - nh) / 2)
+    base_y = y + nh                 # низ товара — он стоит на столе
+    hz = int(y + nh * 0.62)         # дальний край стола проходит за товаром
 
-    # --- тень ---
+    # --- стена -> стол ---
+    img = gradient(W, H, st["wall"][0], st["wall"][1])
+    img = draw_wall(key, img, W, H, pb, hz, has_text)
+    tb = gradient(W, H - hz, st["table"][0], st["table"][1])
+    tb = table_texture(tb, key, st)
+    img.paste(tb, (0, hz))
+    # затемнение у стены и блик на кромке стола
+    ao = Image.linear_gradient("L").transpose(Image.FLIP_TOP_BOTTOM).resize((W, max(2, int(H * 0.05))))
+    ao = ao.point(lambda v: int(v * 0.22))
+    img.paste(Image.new("RGB", ao.size, (0, 0, 0)), (0, hz), ao)
+    ImageDraw.Draw(img).rectangle([0, hz, W, hz + max(2, H // 400)], fill=rgb(st["edge"]))
+    if st["reflect"]:  # пятно света на столе под товаром
+        img = glow(img, x + nw / 2, base_y - nh * 0.04, nw * 0.75, nh * 0.16, rgb(st["ambient"]), 0.9)
+    img = draw_top(key, img, W, H, pb, hz, has_text)
+
+    # --- тени и отражение: товар стоит на столе ---
     layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    sh = Image.new("RGBA", (nw, nh), (0, 0, 0, 0))
-    sh.putalpha(a.point(lambda v: int(v * st["shadow"])))
-    layer.paste(sh, (x, y + int(H * 0.012)), sh)
-    ImageDraw.Draw(layer).ellipse([x + nw * 0.12, y + nh - H * 0.012, x + nw * 0.88, y + nh + H * 0.014],
-                                  fill=(0, 0, 0, int(255 * st["shadow"] * 0.9)))
-    layer = layer.filter(ImageFilter.GaussianBlur(W * 0.012))
+    flat_h = max(6, int(nh * 0.20))
+    flat = a.resize((nw, flat_h), Image.LANCZOS)
+    soft = Image.new("RGBA", (nw, flat_h), (0, 0, 0, 0))
+    soft.putalpha(flat.point(lambda v: int(v * min(1.0, st["shadow"]))))
+    layer.paste(soft, (x + int(nw * 0.03), base_y - int(flat_h * 0.55)), soft)
+    layer = layer.filter(ImageFilter.GaussianBlur(W * 0.018))
+    tight = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    tflat = a.resize((nw, max(4, int(nh * 0.07))), Image.LANCZOS)
+    t2 = Image.new("RGBA", tflat.size, (0, 0, 0, 0))
+    t2.putalpha(tflat.point(lambda v: int(v * min(1.0, st["shadow"] * 1.25))))
+    tight.paste(t2, (x, base_y - int(tflat.height * 0.8)), t2)
+    tight = tight.filter(ImageFilter.GaussianBlur(W * 0.004))
     base = Image.alpha_composite(img.convert("RGBA"), layer)
+    base = Image.alpha_composite(base, tight)
+    if st["reflect"]:
+        rh = max(4, int(nh * 0.40))
+        refl = prod.transpose(Image.FLIP_TOP_BOTTOM).crop((0, 0, nw, rh))
+        fade = ImageOps.invert(Image.linear_gradient("L").resize((nw, rh))).point(lambda v: int(v * 0.38))
+        refl.putalpha(ImageChops.multiply(refl.getchannel("A"), fade))
+        refl = refl.filter(ImageFilter.GaussianBlur(1.5))
+        rl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        rl.paste(refl, (x, base_y - int(nh * 0.02)), refl)
+        base = Image.alpha_composite(base, rl)
     base.paste(prod, (x, y), prod)
     img = base.convert("RGB")
 
@@ -675,17 +788,19 @@ def mh_remove_bg(jpeg_bytes):
 # 6. GEMINI: текст и лёгкая чистка товара
 # ============================================================
 def gemini_call(model, parts, gen_config=None):
+    if not GEMINI_KEY:
+        raise RuntimeError("ключ Gemini не найден в Render (GEMINI_API_KEY)")
     url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % model
     body = {"contents": [{"parts": parts}]}
     if gen_config:
         body["generationConfig"] = gen_config
     r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=120)
     if not r.ok:
-        raise RuntimeError("Gemini %s: %s" % (r.status_code, r.text[:300]))
+        raise RuntimeError("Gemini %s (%s): %s" % (r.status_code, model, r.text[:200].replace("\n", " ")))
     return r.json()
 
 
-def to_b64_jpeg(img, maxside=768):
+def to_b64_jpeg(img, maxside=1024):
     im = img.convert("RGB")
     im.thumbnail((maxside, maxside))
     buf = io.BytesIO()
@@ -693,28 +808,49 @@ def to_b64_jpeg(img, maxside=768):
     return base64.b64encode(buf.getvalue()).decode()
 
 
+TEXT_MODELS = [GEMINI_TEXT_MODEL, "gemini-2.0-flash", "gemini-flash-latest"]
+IMAGE_MODELS = [GEMINI_IMAGE_MODEL, "gemini-2.5-flash-image-preview"]
+
+
 def gemini_text(src_img):
+    """Пишет текст карточки по фото. Пробует несколько моделей, при полном провале кидает понятную ошибку."""
     prompt = (
-        "Ты копирайтер карточек товаров для Wildberries и Ozon. Посмотри на фото товара и верни ТОЛЬКО JSON "
-        "без пояснений такого вида: {\"title\": \"...\", \"sub\": \"...\", \"bullets\": [\"...\", \"...\", \"...\"]}. "
-        "title — название или главная выгода, 1-3 слова, до 20 символов. "
-        "sub — короткая строка до 40 символов. "
-        "bullets — ровно 3 коротких преимущества, каждое до 24 символов. "
-        "Пиши по-русски. Не выдумывай характеристики, которых не видно на фото (мощность, объём, материалы, "
-        "бренд, цифры). Пиши только то, что очевидно по виду товара."
+        "Ты опытный копирайтер карточек товаров для Wildberries и Ozon. Посмотри на фото товара. "
+        "Если на фото видна наклейка или надпись с названием, моделью или характеристиками — используй именно эти данные. "
+        "Верни ТОЛЬКО JSON без пояснений: "
+        "{\"title\": \"...\", \"sub\": \"...\", \"bullets\": [\"...\", \"...\", \"...\"]}. "
+        "title — название товара или главная выгода, 1-3 слова, до 20 символов. "
+        "sub — короткая строка, до 40 символов. "
+        "bullets — ровно 3 коротких преимущества, каждое до 24 символов, без точек в конце. "
+        "Пиши по-русски, ярко и по делу. Не выдумывай то, чего не видно на фото: цифры, мощность, "
+        "материалы, бренды и гарантию упоминай, только если это написано на самом товаре."
     )
-    j = gemini_call(GEMINI_TEXT_MODEL,
-                    [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": to_b64_jpeg(src_img)}}],
-                    {"responseMimeType": "application/json", "temperature": 0.7})
-    raw = j["candidates"][0]["content"]["parts"][0]["text"].strip()
-    if not raw.startswith("{"):
-        raw = raw[raw.index("{"):raw.rindex("}") + 1]
-    data = json.loads(raw)
-    return {
-        "title": str(data.get("title", ""))[:40],
-        "sub": str(data.get("sub", ""))[:70],
-        "bullets": [str(b)[:40] for b in (data.get("bullets") or [])][:3],
-    }
+    last_err = None
+    for model in TEXT_MODELS:
+        try:
+            j = gemini_call(model,
+                            [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": to_b64_jpeg(src_img)}}],
+                            {"responseMimeType": "application/json", "temperature": 0.8, "maxOutputTokens": 800})
+            cands = j.get("candidates") or []
+            if not cands:
+                raise RuntimeError("Gemini вернул пустой ответ (%s)" % str(j.get("promptFeedback"))[:120])
+            parts = cands[0].get("content", {}).get("parts", [])
+            raw = "".join(p.get("text", "") for p in parts).strip()
+            if "{" not in raw:
+                raise RuntimeError("в ответе нет JSON: %s" % raw[:80])
+            data = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
+            res = {
+                "title": str(data.get("title", "")).strip()[:40],
+                "sub": str(data.get("sub", "")).strip()[:70],
+                "bullets": [str(b).strip()[:40] for b in (data.get("bullets") or []) if str(b).strip()][:3],
+            }
+            if not (res["title"] or res["sub"] or res["bullets"]):
+                raise RuntimeError("Gemini вернул пустой текст")
+            return res
+        except Exception as e:
+            last_err = e
+            log.warning("gemini_text %s failed: %s", model, e)
+    raise last_err
 
 
 def parse_own_text(raw):
@@ -727,15 +863,15 @@ def parse_own_text(raw):
 
 
 def retouch(cutout):
-    """Очень лёгкая чистка: пыль, царапины, грязь. Форма и цвет товара не меняются.
-    Если что-то пошло не так или товар заметно изменился — берём оригинальную вырезку."""
+    """Дополнительная лёгкая чистка через Gemini (после обычной). Форма и цвет товара не меняются.
+    Возвращает (картинка, предупреждение или None). Любая ошибка = берём то, что уже есть."""
     if not (RETOUCH_ENABLED and GEMINI_KEY):
-        return cutout
+        return cutout, None
     try:
         a = cutout.getchannel("A")
         bb = a.point(lambda v: 255 if v > 16 else 0).getbbox()
         if not bb:
-            return cutout
+            return cutout, None
         crop = cutout.crop(bb)
         white = Image.new("RGB", crop.size, (255, 255, 255))
         white.paste(crop, mask=crop.getchannel("A"))
@@ -743,41 +879,48 @@ def retouch(cutout):
         buf = io.BytesIO()
         white.save(buf, "PNG")
         prompt = (
-            "Edit this product photo with a very light retouch. Remove dust, lint, dirt, fingerprints, smudges and "
-            "small scratches from the product surface so it looks clean and presentable. Keep the pure white "
-            "background. DO NOT change the product's shape, proportions, colors, materials, logos, text, buttons, "
-            "ports or any details. Do not add anything. Do not crop or move the product. Return the same photo, only cleaner."
+            "Retouch this product photo lightly. Remove dust, lint, dirt, fingerprints, smudges and small scratches "
+            "from the product surface so it looks clean and new. Keep the pure white background. "
+            "DO NOT change the product's shape, proportions, colors, materials, logos, printed text, labels, buttons, "
+            "ports or any details. Do not add or remove parts. Do not crop or move the product. "
+            "Return the same photo, only cleaner."
         )
-        j = gemini_call(GEMINI_IMAGE_MODEL,
-                        [{"text": prompt}, {"inline_data": {"mime_type": "image/png",
-                                                            "data": base64.b64encode(buf.getvalue()).decode()}}],
-                        {"responseModalities": ["TEXT", "IMAGE"]})
-        data = None
-        for p in j["candidates"][0]["content"]["parts"]:
-            blob = p.get("inlineData") or p.get("inline_data")
-            if blob:
-                data = base64.b64decode(blob["data"])
-                break
+        data, last = None, None
+        for model in IMAGE_MODELS:
+            try:
+                j = gemini_call(model,
+                                [{"text": prompt}, {"inline_data": {"mime_type": "image/png",
+                                                                    "data": base64.b64encode(buf.getvalue()).decode()}}],
+                                {"responseModalities": ["TEXT", "IMAGE"]})
+                for p in (j.get("candidates") or [{}])[0].get("content", {}).get("parts", []):
+                    blob = p.get("inlineData") or p.get("inline_data")
+                    if blob:
+                        data = base64.b64decode(blob["data"])
+                        break
+                if data:
+                    break
+            except Exception as e:
+                last = e
+                log.warning("retouch %s failed: %s", model, e)
         if not data:
-            return cutout
+            return cutout, None
         new = Image.open(io.BytesIO(data)).convert("RGB")
         if abs(new.width / new.height - white.width / white.height) > 0.04:
-            return cutout
+            return cutout, None
         new = new.resize(white.size, Image.LANCZOS)
-        # защита: если товар сильно изменился — не берём результат
         s1 = white.resize((48, 48)).convert("L")
         s2 = new.resize((48, 48)).convert("L")
         diff = sum(abs(p1 - p2) for p1, p2 in zip(s1.getdata(), s2.getdata())) / (48 * 48)
-        if diff > 14:
+        if diff > 16:  # товар заметно изменился — не рискуем
             log.info("retouch rejected (diff %.1f)", diff)
-            return cutout
+            return cutout, None
         new = new.resize(crop.size, Image.LANCZOS)
         out = new.convert("RGBA")
         out.putalpha(crop.getchannel("A"))
-        return out
+        return out, None
     except Exception:
-        log.warning("retouch skipped: %s", traceback.format_exc()[-400:])
-        return cutout
+        log.warning("retouch skipped: %s", traceback.format_exc()[-300:])
+        return cutout, None
 
 
 # ============================================================
@@ -791,26 +934,58 @@ def prep_photo(raw):
 
 
 def make_card(file_id, style, size_key, text_mode, own_text, wm, preset_text=None):
+    warns = []
     raw = tg_download(file_id)
     src = prep_photo(raw)
     buf = io.BytesIO()
     src.save(buf, "JPEG", quality=92)
     cut = mh_remove_bg(buf.getvalue())
-    cut = retouch(cut)
+    cut = clean_product(cut)          # пыль, царапины, свет
+    cut, w = retouch(cut)             # доп. чистка Gemini (необязательная)
+    if w:
+        warns.append(w)
     text = preset_text
     if not text:
         if text_mode == "ai":
             try:
                 text = gemini_text(src)
-            except Exception:
-                log.warning("gemini_text failed: %s", traceback.format_exc()[-300:])
+            except Exception as e:
+                warns.append("Текст от ИИ не получился: %s" % str(e)[:170])
                 text = {"title": "", "sub": "", "bullets": []}
         elif text_mode == "own":
             text = parse_own_text(own_text)
         else:
             text = {"title": "", "sub": "", "bullets": []}
     data = compose(cut, style, size_key, text, wm)
-    return data, text
+    return data, text, warns
+
+
+def diag_text():
+    lines = ["Проверка ключей:"]
+    lines.append("• Telegram токен: %s" % ("есть" if BOT_TOKEN else "НЕТ"))
+    lines.append("• База данных: %s" % ("есть" if DATABASE_URL else "НЕТ"))
+    lines.append("• Magic Hour ключ: %s" % ("есть" if MAGIC_KEY else "НЕТ (проверь название переменной в Render)"))
+    lines.append("• Gemini ключ: %s" % ("есть" if GEMINI_KEY else "НЕТ (проверь название переменной в Render)"))
+    if GEMINI_KEY:
+        try:
+            j = gemini_call(TEXT_MODELS[0], [{"text": "Ответь одним словом: ок"}], {"maxOutputTokens": 20})
+            lines.append("• Gemini текст (%s): работает" % TEXT_MODELS[0])
+        except Exception as e:
+            lines.append("• Gemini текст: ОШИБКА — %s" % str(e)[:220])
+        try:
+            r = requests.get("https://generativelanguage.googleapis.com/v1beta/models/%s" % IMAGE_MODELS[0],
+                             params={"key": GEMINI_KEY}, timeout=30)
+            lines.append("• Gemini чистка фото (%s): %s" % (IMAGE_MODELS[0], "модель доступна" if r.ok else "ОШИБКА %s" % r.status_code))
+        except Exception as e:
+            lines.append("• Gemini чистка фото: ОШИБКА — %s" % str(e)[:120])
+    if MAGIC_KEY:
+        try:
+            r = requests.get("%s/image-projects/00000000-0000-0000-0000-000000000000" % MH, headers=mh_headers(), timeout=30)
+            bad = r.status_code in (401, 403)
+            lines.append("• Magic Hour: %s" % ("ключ не принят (%s)" % r.status_code if bad else "ключ принят"))
+        except Exception as e:
+            lines.append("• Magic Hour: ОШИБКА — %s" % str(e)[:120])
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -962,6 +1137,9 @@ def on_message(msg):
         return
     if cmd == "/buy":
         show(chat_id, "Выбери пакет. 1 ⭐ = 1 карточка:", shop_kb_simple())
+        return
+    if cmd == "/diag":
+        show(chat_id, diag_text())
         return
     if cmd == "/id":
         show(chat_id, "Твой ID: %s" % uid)
@@ -1118,7 +1296,7 @@ def run_job(uid, chat_id, job, indices, free):
     res = tg("sendMessage", chat_id=chat_id,
              text="⏳ Делаю карточки: 0/%d. Обычно 30–90 секунд на каждую." % len(indices))
     mid = res.get("result", {}).get("message_id")
-    done, failed = 0, []
+    done, failed, all_warns = 0, [], []
 
     def work(i):
         return make_card(job["photos"][i], job["style"], job["size"], job["text_mode"],
@@ -1130,7 +1308,10 @@ def run_job(uid, chat_id, job, indices, free):
             for fut in as_completed(futs):
                 i = futs[fut]
                 try:
-                    data, text = fut.result()
+                    data, text, warns = fut.result()
+                    for w_ in warns:
+                        if w_ not in all_warns:
+                            all_warns.append(w_)
                     job["texts"][i] = text
                     send_doc(chat_id, data, "card_%d.jpg" % (i + 1), "Карточка №%d" % (i + 1))
                     done += 1
@@ -1158,6 +1339,8 @@ def run_job(uid, chat_id, job, indices, free):
         txt += "\nНе получилось сделать %d — ⭐ вернул на баланс." % len(failed)
     if free:
         txt += "\nЭто бесплатная версия с водяным знаком. Чистые карточки — за 1 ⭐."
+    for w_ in all_warns[:3]:
+        txt += "\n⚠️ " + w_
     txt += "\nБаланс: %d ⭐" % credits
     rows = []
     redo = [("🔁 №%d (1 ⭐)" % (i + 1), "redo:%d" % i) for i in range(len(job["photos"]))]
